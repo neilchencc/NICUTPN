@@ -451,6 +451,7 @@ def apply_record(data: dict):
 
 def load_latest():
     ss = st.session_state
+    ss["clear_pending"] = None
     unit, bed = ss.get("unit"), ss.get("bed_sel")
     recs = list_records(unit, bed) if unit and bed else []
     if recs:
@@ -491,12 +492,30 @@ def do_logout():
     ss["loaded_info"] = ""
 
 
+def ask_clear_bed():
+    st.session_state["clear_pending"] = st.session_state.get("bed_sel")
+
+
+def cancel_clear_bed():
+    st.session_state["clear_pending"] = None
+
+
 def do_clear_bed():
+    """刪除該床所有紀錄,並把畫面輸入重設為預設值。"""
     ss = st.session_state
-    clear_bed(ss["unit"], ss["bed_sel"])
-    ss["confirm_clear"] = False
+    bed = ss["bed_sel"]
+    n = len(list_records(ss["unit"], bed))
+    if n:
+        clear_bed(ss["unit"], bed)
+    ss["clear_pending"] = None
     apply_record({})
-    ss["loaded_info"] = f"{ss['bed_sel']}:已清床 (刪除所有紀錄)"
+    ss["loaded_info"] = ""
+    ss["flash"] = f"{bed} 已清空" + (f" (刪除 {n} 筆紀錄)" if n else " (畫面已重設)")
+
+
+def do_reset_inputs():
+    """未登入時:只把畫面輸入重設為預設值。"""
+    apply_record({})
 
 
 def num(container, label, key, step=1.0, min_value=0.0, max_value=None, **kw):
@@ -574,11 +593,16 @@ def main():
         save_slot = sb.container()
         if ss.get("loaded_info"):
             sb.caption(ss["loaded_info"])
-        if recs:
-            with sb.expander("清床 (刪除此床所有紀錄)"):
-                st.checkbox(f"確認清除 {bed} 的 {len(recs)} 筆紀錄", key="confirm_clear")
-                st.button("清床", on_click=do_clear_bed, disabled=not ss.get("confirm_clear"),
-                          type="secondary")
+        if ss.get("clear_pending") == bed:
+            sb.warning(f"確定要清空 {bed}?"
+                       + (f"將刪除 {len(recs)} 筆紀錄,無法復原。" if recs else "此床尚無紀錄,只會重設畫面。"))
+            c1, c2 = sb.columns(2)
+            c1.button("確認清空", on_click=do_clear_bed, type="primary",
+                      use_container_width=True)
+            c2.button("取消", on_click=cancel_clear_bed, use_container_width=True)
+        else:
+            sb.button(f"🗑️ 清空 {bed} 資料", on_click=ask_clear_bed,
+                      use_container_width=True)
     else:
         with sb.expander("🔐 登入 (儲存 / 讀取床位紀錄)"):
             with st.form("login_form", clear_on_submit=False):
@@ -588,6 +612,8 @@ def main():
             if ss.get("login_error"):
                 st.error(ss["login_error"])
         sb.caption("未登入也可直接計算,但不會儲存紀錄")
+        sb.button("🗑️ 清空輸入 (重設為預設值)", on_click=do_reset_inputs,
+                  use_container_width=True)
     if ss.get("flash"):
         sb.success(ss.pop("flash"))
 
