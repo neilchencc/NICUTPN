@@ -389,19 +389,38 @@ def summary_strings(p: dict, r: dict) -> dict:
 # UI
 # ----------------------------------------------------------------------
 DEFAULTS = {
-    "bed": "", "bw_g": 2400.0, "q_h": 3.0,
-    "pf_conc": 16.0, "pf_vol": 0.0, "spf_kcal30": 26.0, "spf_vol": 0.0,
-    "mf_conc": 14.0, "mf_vol": 20.0, "hm_pk": 0.0, "hm_vol": 0.0,
+    "bed": "", "bw_g": 2400, "q_h": 3,
+    "pf_conc": 16, "pf_vol": 0, "spf_kcal30": 26, "spf_vol": 0,
+    "mf_conc": 14, "mf_vol": 20, "hm_pk": 0, "hm_vol": 0,
     "iv1_preset": "自訂", "iv1_name": "", "iv1_glu": 10.0, "iv1_rate": 0.0,
     "iv1_na": 0.0, "iv1_k": 0.0,
     "iv2_preset": "自訂", "iv2_name": "", "iv2_glu": 0.0, "iv2_rate": 0.0,
     "iv2_na": 0.0, "iv2_k": 0.0,
-    "pn_preset": "自訂", "pn_glu": 10.0, "pn_aa": 2.5, "pn_rate": 8.5, "fat_ml": 20.0,
-    "pn_na": 20.7, "pn_k": 22.0, "pn_mg": 3.3, "pn_ca": 10.0, "pn_p": 5.0, "pn_bag_ml": 0.0,
+    "pn_preset": "自訂", "pn_glu": 10.0, "pn_aa": 2.5, "pn_rate": 8.5, "fat_ml": 20,
+    "pn_na": 20.7, "pn_k": 22.0, "pn_mg": 3.3, "pn_ca": 10.0, "pn_p": 5.0, "pn_bag_ml": 0,
     "milk_type": "Enfalac LBW 優生早產兒", "fort_type": "Similac HMF 心美力母乳營養補充品",
-    "milk_link": True, "milk_conc": 14.0, "milk_std": 14.0, "milk_vol": 20.0,
-    "milk_q": 3.0, "milk_pk": 0.0, "fe_gtt": 0.0, "fe_times": 0.0,
+    "milk_link": True, "milk_conc": 14, "milk_std": 14, "milk_vol": 20,
+    "milk_q": 3, "milk_pk": 0, "fe_gtt": 0, "fe_times": 0,
 }
+
+# 輸入精度:整數欄位 = DEFAULTS 中為 int 者 (另加 RI 的 U 數);
+# 一位小數 = IV / PN glucose、PN AA、電解質、各滴速 (mL/hr)
+INT_KEYS = {k for k, v in DEFAULTS.items() if type(v) is int} | {"ri_u"}
+DEC2_KEYS = {"ri_tgt"}   # RI 目標劑量 (U/kg/hr) 需兩位小數
+
+
+def to_int(v, default=0) -> int:
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_dec1(v, default=0.0) -> float:
+    try:
+        return round(float(v), 1)
+    except (TypeError, ValueError):
+        return default
 
 
 def apply_ivf(k: str):
@@ -437,11 +456,10 @@ def apply_record(data: dict):
         v = data.get(k, default)
         if k in valid and v not in valid[k]:
             v = default
-        if isinstance(default, float):
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                v = default
+        if type(default) is int:
+            v = to_int(v, default)
+        elif type(default) is float:
+            v = to_dec1(v, default)
         ss[k] = v
     ss["comp_override"] = ({"milk_type": ss["milk_type"], "fort_type": ss["fort_type"],
                             "milk": data.get("milk_comp"), "fort": data.get("fort_comp")}
@@ -518,9 +536,25 @@ def do_reset_inputs():
     apply_record({})
 
 
-def num(container, label, key, step=1.0, min_value=0.0, max_value=None, **kw):
-    return container.number_input(label, min_value=min_value, max_value=max_value,
-                                  step=step, key=key, **kw)
+def num(container, label, key, step=None, min_value=0, max_value=None, **kw):
+    """依欄位決定精度:整數 / 一位小數 / (RI 目標) 兩位小數。"""
+    if key in INT_KEYS:
+        if "value" in kw:
+            kw["value"] = to_int(kw["value"])
+        return container.number_input(
+            label, min_value=int(min_value), step=max(1, int(step or 1)), format="%d",
+            max_value=None if max_value is None else int(max_value), key=key, **kw)
+    if "value" in kw:
+        kw["value"] = float(kw["value"])
+    if key in DEC2_KEYS:
+        kw.setdefault("format", "%.2f")
+        step = step or 0.01
+    else:
+        kw["format"] = "%.1f"
+        step = max(0.1, float(step or 0.1))
+    return container.number_input(
+        label, min_value=float(min_value), step=float(step),
+        max_value=None if max_value is None else float(max_value), key=key, **kw)
 
 
 def status(ok: bool) -> str:
@@ -742,7 +776,7 @@ def main():
             num(b, "一天次數", "fe_times", step=1.0)
 
         # --- 計算 ---
-        p = {k: ss[k] for k in DEFAULTS}
+        p = {k: (to_dec1(ss[k]) if type(DEFAULTS[k]) is float else ss[k]) for k in DEFAULTS}
         feed_ml_day = sum(ss[k] for k in ("pf_vol", "spf_vol", "mf_vol", "hm_vol")) * 24 / ss["q_h"]
         p["milk_ml_day"] = feed_ml_day if ss["milk_link"] else ss["milk_vol"] * 24 / ss["milk_q"]
         p["milk_ratio"] = ss["milk_conc"] / ss["milk_std"]
@@ -757,7 +791,8 @@ def main():
         if save_slot is not None:
             if save_slot.button(f"💾 儲存 {ss['bed_sel']} 紀錄", type="primary",
                                 use_container_width=True):
-                data = {k: ss[k] for k in DEFAULTS}
+                data = {k: (to_dec1(ss[k]) if type(DEFAULTS[k]) is float else ss[k])
+                        for k in DEFAULTS}
                 data["milk_comp"] = p["milk_comp"]
                 data["fort_comp"] = p["fort_comp"]
                 data["summary"] = s
