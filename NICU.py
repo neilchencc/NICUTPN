@@ -9,9 +9,20 @@ NICU 營養計算器 (Streamlit)
   - PN 滲透壓 = Glu% x 50 + AA% x 100 + Na x 2 + K x 2
   - 電解質、Ca/P、Fe、Zn 與奶水成分 (每公升) / 母乳添加劑 (每 100 mL) 小計
 另含「RI 計算」與參考表 (IVF、本院 PN 套餐、奶水成分)。
-執行: streamlit run NICU.py
+登入 (選用): 帳號 PICU (床位 PI-01~PI-25) / NBC (床位 NBC-01~NBC-27),
+  登入後可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
+  儲存位置: secrets 有 [gcp_service_account] 與 [gsheet] 時存到 Google Sheets
+  (需 pip install gspread),否則存本機 SQLite (nicu_records.db,環境變數 NICU_DB 可改路徑)。
+  密碼可在 .streamlit/secrets.toml 以 [passwords] PICU = "..." 覆寫。
+執行: streamlit run streamlit_app.py
 """
 import base64
+import hmac
+import json
+import os
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -96,6 +107,143 @@ FORTIFIER_TABLE = {
     "Similac HMF 心美力母乳營養補充品": [14, 1, 117, 67, 15, 63, 0.35, 1],
     "Enfamil HMF 優生母乳強化營養品": [14, 1.1, 90, 50, 16, 29, 1.44, 0.72],
 }
+
+
+# ----------------------------------------------------------------------
+# 登入與床位紀錄
+# ----------------------------------------------------------------------
+TW_TZ = timezone(timedelta(hours=8))
+UNITS = {
+    "PICU": [f"PI-{i:02d}" for i in range(1, 26)],
+    "NBC": [f"NBC-{i:02d}" for i in range(1, 28)],
+}
+DEFAULT_PASSWORD = "hmmch"
+DB_PATH = Path(os.environ.get("NICU_DB", Path(__file__).parent / "nicu_records.db"))
+
+
+def get_password(unit: str) -> str:
+    """優先使用 st.secrets["passwords"][unit],否則用預設密碼。"""
+    try:
+        return str(st.secrets["passwords"][unit])
+    except Exception:
+        return DEFAULT_PASSWORD
+
+
+def check_login(unit: str, password: str) -> bool:
+    return unit in UNITS and hmac.compare_digest(password.encode(), get_password(unit).encode())
+
+
+# --- 儲存後端: 有設定 Google Sheets secrets 就用 Google Sheets,否則用本機 SQLite ---
+GSHEET_TAB = "records"
+GSHEET_HEADER = ["id", "unit", "bed", "saved_at", "data"]
+GSHEET_CACHE_TTL = 30  # 秒;避免每次畫面更新都讀 Google Sheets (API 讀取上限約 60 次/分鐘)
+
+
+def use_gsheets() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets and "gsheet" in st.secrets
+    except Exception:
+        return False
+
+
+def storage_name() -> str:
+    return "Google Sheets" if use_gsheets() else "本機 SQLite"
+
+
+@st.cache_resource(show_spinner=False)
+def _gsheet_ws():
+    import gspread  # 只有使用 Google Sheets 時才需要安裝
+    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    cfg = st.secrets["gsheet"]
+    sh = gc.open_by_url(cfg["url"]) if "url" in cfg else gc.open_by_key(cfg["key"])
+    try:
+        ws = sh.worksheet(GSHEET_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=GSHEET_TAB, rows=1000, cols=len(GSHEET_HEADER))
+        ws.append_row(GSHEET_HEADER)
+    return ws
+
+
+@st.cache_data(ttl=GSHEET_CACHE_TTL, show_spinner=False)
+def _gsheet_rows() -> list:
+    """[(sheet 列號, id, unit, bed, saved_at, data), ...]"""
+    values = _gsheet_ws().get_all_values()
+    rows = []
+    for i, v in enumerate(values[1:], start=2):
+        v = (v + [""] * 5)[:5]
+        try:
+            rows.append((i, int(v[0]), v[1], v[2], v[3], v[4]))
+        except ValueError:
+            continue
+    return rows
+
+
+def _db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""CREATE TABLE IF NOT EXISTS records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        unit TEXT NOT NULL, bed TEXT NOT NULL, saved_at TEXT NOT NULL, data TEXT NOT NULL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_bed ON records(unit, bed, id)")
+    return con
+
+
+def _unit_rows(unit: str) -> list:
+    """該單位所有紀錄 [(id, bed, saved_at, data_json), ...],由舊到新。"""
+    if use_gsheets():
+        rows = [(i, b, t, d) for _, i, u, b, t, d in _gsheet_rows() if u == unit]
+        return sorted(rows)
+    with closing(_db()) as con:
+        return con.execute("SELECT id, bed, saved_at, data FROM records WHERE unit=? "
+                           "ORDER BY id", (unit,)).fetchall()
+
+
+def save_record(unit: str, bed: str, data: dict) -> str:
+    now = datetime.now(TW_TZ)
+    saved_at = now.strftime("%Y-%m-%d %H:%M")
+    payload = json.dumps(data, ensure_ascii=False)
+    if use_gsheets():
+        rec_id = int(now.timestamp() * 1000)  # 以毫秒時間當 id,免讀取即可新增
+        _gsheet_ws().append_row([rec_id, unit, bed, saved_at, payload],
+                                value_input_option="RAW")
+        _gsheet_rows.clear()
+    else:
+        with closing(_db()) as con, con:
+            con.execute("INSERT INTO records (unit, bed, saved_at, data) VALUES (?, ?, ?, ?)",
+                        (unit, bed, saved_at, payload))
+    return saved_at
+
+
+def list_records(unit: str, bed: str) -> list:
+    """[(id, saved_at), ...] 由新到舊。"""
+    return [(i, t) for i, b, t, _ in reversed(_unit_rows(unit)) if b == bed]
+
+
+def load_record(unit: str, rec_id: int) -> dict:
+    for i, _, _, d in _unit_rows(unit):
+        if i == rec_id:
+            return json.loads(d)
+    return {}
+
+
+def latest_by_bed(unit: str) -> dict:
+    """{bed: (saved_at, data)} 每床最近一筆。"""
+    out = {}
+    for _, b, t, d in _unit_rows(unit):   # 由舊到新,後者覆蓋前者
+        out[b] = (t, d)
+    return {b: (t, json.loads(d)) for b, (t, d) in out.items()}
+
+
+def clear_bed(unit: str, bed: str):
+    if use_gsheets():
+        _gsheet_rows.clear()
+        ws = _gsheet_ws()
+        targets = [r for r, _, u, b, _, _ in _gsheet_rows() if u == unit and b == bed]
+        for r in sorted(targets, reverse=True):   # 由下往上刪,列號才不會位移
+            ws.delete_rows(r)
+        _gsheet_rows.clear()
+    else:
+        with closing(_db()) as con, con:
+            con.execute("DELETE FROM records WHERE unit=? AND bed=?", (unit, bed))
 
 
 # ----------------------------------------------------------------------
@@ -280,6 +428,77 @@ def pn_labels():
                       zip(PN_SETS["Glucose (%)"], PN_SETS["AA (%)"])]
 
 
+def apply_record(data: dict):
+    """把紀錄寫回輸入欄位 (空 dict = 重設為預設值)。只能在 callback 中呼叫。"""
+    ss = st.session_state
+    valid = {"iv1_preset": IVF_TABLE, "iv2_preset": IVF_TABLE, "pn_preset": pn_labels(),
+             "milk_type": MILK_TABLE, "fort_type": FORTIFIER_TABLE}
+    for k, default in DEFAULTS.items():
+        v = data.get(k, default)
+        if k in valid and v not in valid[k]:
+            v = default
+        if isinstance(default, float):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = default
+        ss[k] = v
+    ss["comp_override"] = ({"milk_type": ss["milk_type"], "fort_type": ss["fort_type"],
+                            "milk": data.get("milk_comp"), "fort": data.get("fort_comp")}
+                           if data else None)
+    ss["load_n"] = ss.get("load_n", 0) + 1   # 讓奶水成分表重新載入
+
+
+def load_latest():
+    ss = st.session_state
+    unit, bed = ss.get("unit"), ss.get("bed_sel")
+    recs = list_records(unit, bed) if unit and bed else []
+    if recs:
+        apply_record(load_record(unit, recs[0][0]))
+        ss["loaded_info"] = f"{bed}:已載入 {recs[0][1]} 的紀錄"
+    else:
+        apply_record({})
+        ss["loaded_info"] = f"{bed}:尚無紀錄,已重設為預設值"
+
+
+def load_selected_history():
+    ss = st.session_state
+    unit, bed = ss["unit"], ss["bed_sel"]
+    rec_id = ss.get(f"hist_{unit}_{bed}")
+    if rec_id is not None:
+        apply_record(load_record(unit, rec_id))
+        t = dict(list_records(unit, bed)).get(rec_id, "")
+        ss["loaded_info"] = f"{bed}:已載入 {t} 的紀錄"
+
+
+def do_login():
+    ss = st.session_state
+    unit = ss.get("login_user", "").strip().upper()
+    if check_login(unit, ss.get("login_pw", "")):
+        ss["unit"] = unit
+        ss["bed_sel"] = UNITS[unit][0]
+        ss["login_error"] = ""
+        load_latest()
+    else:
+        ss["login_error"] = "帳號或密碼錯誤"
+    ss["login_pw"] = ""
+
+
+def do_logout():
+    ss = st.session_state
+    ss.pop("unit", None)
+    apply_record({})          # 登出後清空畫面上的病人資料
+    ss["loaded_info"] = ""
+
+
+def do_clear_bed():
+    ss = st.session_state
+    clear_bed(ss["unit"], ss["bed_sel"])
+    ss["confirm_clear"] = False
+    apply_record({})
+    ss["loaded_info"] = f"{ss['bed_sel']}:已清床 (刪除所有紀錄)"
+
+
 def num(container, label, key, step=1.0, min_value=0.0, max_value=None, **kw):
     return container.number_input(label, min_value=min_value, max_value=max_value,
                                   step=step, key=key, **kw)
@@ -323,15 +542,79 @@ def main():
     for k, v in DEFAULTS.items():
         ss.setdefault(k, v)
 
-    # --- 病人資料 ---
+    # --- 登入 / 床位 ---
     sb = st.sidebar
+    unit = ss.get("unit")
+    save_slot = None
+    if unit:
+        beds = UNITS[unit]
+        latest = latest_by_bed(unit)
+        a, b = sb.columns([3, 2])
+        a.markdown(f"**單位:{unit}**")
+        b.button("登出", on_click=do_logout, use_container_width=True)
+        sb.caption(f"儲存位置:{storage_name()}")
+
+        def bed_label(bed):
+            if bed in latest:
+                t, d = latest[bed]
+                return f"{bed} ● {d.get('bw_g', 0):g} g · {t[5:]}"
+            return f"{bed} (空床)"
+
+        sb.selectbox("床位", beds, key="bed_sel", format_func=bed_label,
+                     on_change=load_latest)
+        bed = ss["bed_sel"]
+        recs = list_records(unit, bed)
+        if recs:
+            rec_times = dict(recs)
+            c1, c2 = sb.columns([3, 2])
+            c1.selectbox("歷次紀錄", [r_[0] for r_ in recs], key=f"hist_{unit}_{bed}",
+                         format_func=lambda i: rec_times.get(i, ""),
+                         label_visibility="collapsed")
+            c2.button("載入", on_click=load_selected_history, use_container_width=True)
+        save_slot = sb.container()
+        if ss.get("loaded_info"):
+            sb.caption(ss["loaded_info"])
+        if recs:
+            with sb.expander("清床 (刪除此床所有紀錄)"):
+                st.checkbox(f"確認清除 {bed} 的 {len(recs)} 筆紀錄", key="confirm_clear")
+                st.button("清床", on_click=do_clear_bed, disabled=not ss.get("confirm_clear"),
+                          type="secondary")
+    else:
+        with sb.expander("🔐 登入 (儲存 / 讀取床位紀錄)"):
+            with st.form("login_form", clear_on_submit=False):
+                st.text_input("帳號 (PICU / NBC)", key="login_user")
+                st.text_input("密碼", type="password", key="login_pw")
+                st.form_submit_button("登入", on_click=do_login, use_container_width=True)
+            if ss.get("login_error"):
+                st.error(ss["login_error"])
+        sb.caption("未登入也可直接計算,但不會儲存紀錄")
+    if ss.get("flash"):
+        sb.success(ss.pop("flash"))
+
+    # --- 病人資料 ---
     sb.header("病人資料")
-    sb.text_input("床號 / 備註", key="bed")
+    sb.text_input("備註 (請勿輸入姓名 / 病歷號)", key="bed")
     num(sb, "體重 BW (g)", "bw_g", step=10.0, min_value=300.0, max_value=8000.0)
     num(sb, "餵食間隔 q (h)", "q_h", step=1.0, min_value=1.0, max_value=24.0)
     sb.caption("IV / PN 速率單位為 mL/hr (微滴 gtt/min = mL/hr)")
 
-    tab_main, tab_ri, tab_ref = st.tabs(["營養計算", "RI 計算", "參考表"])
+    tab_names = ["營養計算", "RI 計算", "參考表"] + (["床位總覽"] if unit else [])
+    tab_main, tab_ri, tab_ref, *tab_beds = st.tabs(tab_names)
+
+    if unit:
+        with tab_beds[0]:
+            rows = []
+            for b_ in UNITS[unit]:
+                if b_ in latest:
+                    t, d = latest[b_]
+                    sm = d.get("summary", {})
+                    rows.append({"床位": b_, "上次儲存": t, "BW (g)": d.get("bw_g"),
+                                 "備註": d.get("bed", ""), **sm})
+                else:
+                    rows.append({"床位": b_, "上次儲存": "—"})
+            st.caption(f"{unit} 各床最近一次紀錄 (於側邊欄選擇床位即可載入)")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                         height=min(40 + 35 * len(rows), 950))
 
     with tab_main:
         top = st.container()
@@ -412,14 +695,21 @@ def main():
             num(c, "添加劑包數", "milk_pk", step=1.0)
             num(d, "每餐 (mL)", "milk_vol", step=1.0, disabled=ss["milk_link"])
             num(e, "q (h)", "milk_q", step=1.0, min_value=1.0, disabled=ss["milk_link"])
+            milk_vals = MILK_TABLE[ss["milk_type"]][1:]
+            fort_vals = FORTIFIER_TABLE[ss["fort_type"]][1:]
+            ov = ss.get("comp_override")   # 由紀錄載入、可能經手動修改的成分
+            if ov and ov.get("milk_type") == ss["milk_type"] and ov.get("milk"):
+                milk_vals = ov["milk"]
+            if ov and ov.get("fort_type") == ss["fort_type"] and ov.get("fort"):
+                fort_vals = ov["fort"]
             comp = pd.DataFrame({
                 "成分": NUTRIENTS,
-                "奶水 (每公升)": MILK_TABLE[ss["milk_type"]][1:],
-                "添加劑 (每 100 mL)": FORTIFIER_TABLE[ss["fort_type"]][1:],
+                "奶水 (每公升)": [float(v) for v in milk_vals],
+                "添加劑 (每 100 mL)": [float(v) for v in fort_vals],
             })
-            comp = st.data_editor(comp, hide_index=True, use_container_width=True,
-                                  disabled=["成分"],
-                                  key=f"comp_{ss['milk_type']}_{ss['fort_type']}")
+            comp = st.data_editor(
+                comp, hide_index=True, use_container_width=True, disabled=["成分"],
+                key=f"comp_{ss['milk_type']}_{ss['fort_type']}_{ss.get('load_n', 0)}")
             st.markdown("**鐵劑** (1 gtt = 2.5 mg)")
             a, b = st.columns(2)
             num(a, "每次 gtt", "fe_gtt", step=1.0)
@@ -435,9 +725,26 @@ def main():
         p["iv1_name"] = ss["iv1_name"] or "IVF"
         p["iv2_name"] = ss["iv2_name"] or "IV-2"
         r = calc_nicu(p)
+        s = summary_strings(p, r)
+
+        # --- 儲存 (需登入) ---
+        if save_slot is not None:
+            if save_slot.button(f"💾 儲存 {ss['bed_sel']} 紀錄", type="primary",
+                                use_container_width=True):
+                data = {k: ss[k] for k in DEFAULTS}
+                data["milk_comp"] = p["milk_comp"]
+                data["fort_comp"] = p["fort_comp"]
+                data["summary"] = s
+                t = save_record(ss["unit"], ss["bed_sel"], data)
+                ss["flash"] = f"已儲存 {ss['bed_sel']} ({t})"
+                ss["loaded_info"] = ""
+                st.rerun()
 
         # --- 頂部摘要 ---
         with top:
+            if unit:
+                st.markdown(f"#### 🛏️ {unit} · {ss['bed_sel']}"
+                            + (f" — {ss['bed']}" if ss["bed"] else ""))
             m = st.columns(5)
             m[0].metric("TF (mL/kg/day)", f"{r['tf']:.0f}")
             m[1].metric("Cal* (kcal/kg/day)", f"{r['cal']:.1f}")
@@ -552,7 +859,6 @@ def main():
 
         # --- 今日結果 ---
         st.subheader("今日結果")
-        s = summary_strings(p, r)
         st.dataframe(pd.DataFrame([{"BW": ss["bw_g"], **s}]), hide_index=True,
                      use_container_width=True)
         st.code("\t".join([fmt(ss["bw_g"])] + list(s.values())), language=None)
