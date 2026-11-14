@@ -10,11 +10,11 @@ NICU 營養計算器 (Streamlit)
   - 電解質、Ca/P、Fe、Zn 與奶水成分 (每公升) / 母乳添加劑 (每 100 mL) 小計
 另含「RI 計算」與參考表 (IVF、本院 PN 套餐、奶水成分)。
 登入 (選用): 帳號 PICU (床位 PI-01~PI-25) / NBC (床位 NBC-01~NBC-27),
-  登入後可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
+  在標題列「登入 / 註冊」登入後,可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
   儲存位置: secrets 有 [gcp_service_account] 與 [gsheet] 時存到 Google Sheets
   (需 pip install gspread),否則存本機 SQLite (nicu_records.db,環境變數 NICU_DB 可改路徑)。
   密碼可在 .streamlit/secrets.toml 以 [passwords] PICU = "..." 覆寫。
-個人帳號 (移植自 TPN 計算器,與上面的單位登入互相獨立):
+個人帳號 (移植自 TPN 計算器;與單位帳號共用同一個登入對話框):
   - 標題旁的按鈕: 登入 / 註冊 (帳號、密碼皆需 4 個字以上,密碼以 PBKDF2 雜湊儲存)
   - 登入後可選擇病患、儲存、看歷史紀錄 (載入 / 刪除)、新增 / 管理 / 刪除病患
   - 資料存在 SQLite nicu_accounts.db (環境變數 NICU_ACCT_DB_DIR 可指定資料夾)
@@ -256,6 +256,20 @@ def clear_bed(unit: str, bed: str):
             con.execute("DELETE FROM records WHERE unit=? AND bed=?", (unit, bed))
 
 
+def delete_unit_record(unit: str, rec_id: int):
+    """刪除單位帳號的單筆紀錄。"""
+    if use_gsheets():
+        _gsheet_rows.clear()
+        for r, i, u, _, _, _ in _gsheet_rows():
+            if i == rec_id and u == unit:
+                _gsheet_ws().delete_rows(r)
+                break
+        _gsheet_rows.clear()
+    else:
+        with closing(_db()) as con, con:
+            con.execute("DELETE FROM records WHERE id=? AND unit=?", (rec_id, unit))
+
+
 # ----------------------------------------------------------------------
 # 核心計算 (與 Excel 公式一致)
 # ----------------------------------------------------------------------
@@ -475,70 +489,6 @@ def apply_record(data: dict):
                             "milk": data.get("milk_comp"), "fort": data.get("fort_comp")}
                            if data else None)
     ss["load_n"] = ss.get("load_n", 0) + 1   # 讓奶水成分表重新載入
-
-
-def load_latest():
-    ss = st.session_state
-    ss["clear_pending"] = None
-    unit, bed = ss.get("unit"), ss.get("bed_sel")
-    recs = list_records(unit, bed) if unit and bed else []
-    if recs:
-        apply_record(load_record(unit, recs[0][0]))
-        ss["loaded_info"] = f"{bed}:已載入 {recs[0][1]} 的紀錄"
-    else:
-        apply_record({})
-        ss["loaded_info"] = f"{bed}:尚無紀錄,已重設為預設值"
-
-
-def load_selected_history():
-    ss = st.session_state
-    unit, bed = ss["unit"], ss["bed_sel"]
-    rec_id = ss.get(f"hist_{unit}_{bed}")
-    if rec_id is not None:
-        apply_record(load_record(unit, rec_id))
-        t = dict(list_records(unit, bed)).get(rec_id, "")
-        ss["loaded_info"] = f"{bed}:已載入 {t} 的紀錄"
-
-
-def do_login():
-    ss = st.session_state
-    unit = ss.get("login_user", "").strip().upper()
-    if check_login(unit, ss.get("login_pw", "")):
-        ss["unit"] = unit
-        ss["bed_sel"] = UNITS[unit][0]
-        ss["login_error"] = ""
-        load_latest()
-    else:
-        ss["login_error"] = "帳號或密碼錯誤"
-    ss["login_pw"] = ""
-
-
-def do_logout():
-    ss = st.session_state
-    ss.pop("unit", None)
-    apply_record({})          # 登出後清空畫面上的病人資料
-    ss["loaded_info"] = ""
-
-
-def ask_clear_bed():
-    st.session_state["clear_pending"] = st.session_state.get("bed_sel")
-
-
-def cancel_clear_bed():
-    st.session_state["clear_pending"] = None
-
-
-def do_clear_bed():
-    """刪除該床所有紀錄,並把畫面輸入重設為預設值。"""
-    ss = st.session_state
-    bed = ss["bed_sel"]
-    n = len(list_records(ss["unit"], bed))
-    if n:
-        clear_bed(ss["unit"], bed)
-    ss["clear_pending"] = None
-    apply_record({})
-    ss["loaded_info"] = ""
-    ss["flash"] = f"{bed} 已清空" + (f" (刪除 {n} 筆紀錄)" if n else " (畫面已重設)")
 
 
 def do_reset_inputs():
@@ -777,8 +727,9 @@ def db_safe(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except sqlite3.Error as e:
-            ss._acct_db_err = f"資料庫錯誤 ({type(e).__name__}):{e}\n\n資料庫位置:{ACCT_DB_PATH}"
+        except Exception as e:  # SQLite / Google Sheets 等錯誤
+            ss._acct_db_err = (f"資料存取錯誤 ({type(e).__name__}):{e}\n\n"
+                               f"儲存位置:{storage_name() if ss.get('unit') else ACCT_DB_PATH}")
     return wrapper
 
 
@@ -788,15 +739,64 @@ def show_db_error() -> None:
         st.error(err)
 
 
-# --- callbacks: 帳號 ---
+# --- 登入狀態 ---
+# 單位帳號 (PICU / NBC): ss.unit + ss.bed_sel (床位);個人帳號: ss.user + ss.patient_id (病患)
+def _clear_login() -> None:
+    for k in ["unit", "user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
+        ss.pop(k, None)
+
+
+def _unit_load_latest() -> None:
+    """載入目前床位最近一筆紀錄;沒有紀錄就回到預設值。"""
+    unit, bed = ss.unit, ss.bed_sel
+    recs = [(t, d) for _, b, t, d in _unit_rows(unit) if b == bed]  # 由舊到新
+    if recs:
+        acct_apply(json.loads(recs[-1][1]))
+        acct_flash("info", f"{bed}:已載入 {recs[-1][0]} 的紀錄")
+    else:
+        acct_apply({})
+        acct_flash("info", f"{bed}:尚無紀錄,已重設為預設值")
+
+
+def target_records(target: tuple) -> list:
+    """[(id, 時間, 備註, data), ...] 由新到舊。
+    target: ("unit", 單位, 床位) 或 ("acct", 病患 id)。"""
+    if target[0] == "unit":
+        _, unit, bed = target
+        out = []
+        for i, b, t, d in reversed(_unit_rows(unit)):
+            if b == bed:
+                dd = json.loads(d)
+                out.append((i, t[:16], dd.get("note", ""), dd))
+        return out
+    return [(r["id"], r["created_at"][:16], r["note"] or "", json.loads(r["data"]))
+            for r in acct_list_records(ss.user["id"], target[1])]
+
+
+# --- callbacks: 登入 / 註冊 / 登出 ---
 @db_safe
 def cb_login() -> None:
-    user = acct_verify_user(ss.get("acct_li_user", ""), ss.get("acct_li_pw", ""))
+    name = ss.get("acct_li_user", "").strip()
+    pw = ss.get("acct_li_pw", "")
+    ss.acct_li_pw = ""
+    if name.upper() in UNITS:  # 單位帳號 PICU / NBC
+        unit = name.upper()
+        if not check_login(unit, pw):
+            ss._acct_auth_err = "帳號或密碼錯誤"
+            return
+        _clear_login()
+        ss.unit = unit
+        ss.bed_sel = UNITS[unit][0]
+        _unit_load_latest()
+        acct_flash("success", f"已登入單位 {unit}")
+        request_app_rerun()
+        return
+    user = acct_verify_user(name, pw)  # 個人帳號
     if not user:
         ss._acct_auth_err = "帳號或密碼錯誤"
         return
+    _clear_login()
     ss.user = user
-    ss.acct_li_pw = ""
     plist = acct_list_patients(user["id"])
     if plist:
         ss.patient_id = plist[0]["id"]
@@ -808,6 +808,9 @@ def cb_login() -> None:
 @db_safe
 def cb_register() -> None:
     u, p, p2 = ss.get("acct_rg_user", ""), ss.get("acct_rg_pw", ""), ss.get("acct_rg_pw2", "")
+    if u.strip().upper() in UNITS:
+        ss._acct_auth_err = f"「{u.strip()}」是單位帳號,請直接在「登入」頁以單位密碼登入"
+        return
     if p != p2:
         ss._acct_auth_err = "兩次輸入的密碼不一致"
         return
@@ -815,6 +818,7 @@ def cb_register() -> None:
     if err:
         ss._acct_auth_err = err
         return
+    _clear_login()
     ss.user = {"id": uid, "username": u.strip()}
     ss.acct_rg_pw = ss.acct_rg_pw2 = ""
     acct_flash("success", "帳號已建立,請新增第一位病患")
@@ -822,13 +826,28 @@ def cb_register() -> None:
 
 
 def cb_logout() -> None:
-    for k in ["user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
-        ss.pop(k, None)
-    acct_apply({})
+    _clear_login()
+    acct_apply({})  # 登出後清空畫面上的病人資料
     acct_flash("info", "已登出")
 
 
-# --- callbacks: 病患 ---
+# --- callbacks: 床位 / 病患 ---
+@db_safe
+def cb_select_bed() -> None:
+    _unit_load_latest()
+
+
+@db_safe
+def cb_clear_bed(unit: str, bed: str) -> None:
+    """刪除該床所有紀錄,並把畫面輸入重設為預設值。"""
+    n = len(target_records(("unit", unit, bed)))
+    if n:
+        clear_bed(unit, bed)
+    acct_apply({})
+    acct_flash("success", f"{bed} 已清空" + (f" (刪除 {n} 筆紀錄)" if n else " (畫面已重設)"))
+    request_app_rerun()
+
+
 @db_safe
 def cb_select_patient() -> None:
     acct_load_latest(ss.patient_id)
@@ -870,11 +889,17 @@ def cb_delete_patient(pid: int, name: str) -> None:
 
 # --- callbacks: 紀錄 ---
 @db_safe
-def cb_save_record(pid: int, payload: dict) -> None:
+def cb_save_record(target: tuple, payload: dict) -> None:
     note = ss.get("acct_note", "").strip()
-    if acct_add_record(ss.user["id"], pid, note, payload):
+    if target[0] == "unit":
+        _, unit, bed = target
+        t = save_record(unit, bed, {**payload, "note": note})
+        ok, msg = True, f"已儲存 {bed} ({t})"
+    else:
+        ok, msg = acct_add_record(ss.user["id"], target[1], note, payload), "已儲存紀錄"
+    if ok:
         ss.acct_note = ""
-        acct_flash("success", "已儲存紀錄", seconds=1)
+        acct_flash("success", msg, seconds=1.5)
     else:
         acct_flash("error", "儲存失敗:找不到此病患")
     request_app_rerun()
@@ -888,8 +913,11 @@ def cb_load_record(data: dict, created_at: str) -> None:
 
 
 @db_safe
-def cb_delete_record(rid: int) -> None:
-    acct_delete_record(ss.user["id"], rid)
+def cb_delete_record(target: tuple, rid: int) -> None:
+    if target[0] == "unit":
+        delete_unit_record(target[1], rid)
+    else:
+        acct_delete_record(ss.user["id"], rid)
     ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
 
 
@@ -908,10 +936,13 @@ def auth_dialog() -> None:
     tab_login, tab_reg = st.tabs(["登入", "建立帳號"])
     with tab_login:
         with st.form("acct_login_form", border=False):
-            st.text_input("帳號", key="acct_li_user")
+            st.text_input("帳號", key="acct_li_user",
+                          help="單位帳號 PICU / NBC (床位紀錄),或自己建立的個人帳號 (病患紀錄)")
             st.text_input("密碼", type="password", key="acct_li_pw")
             st.form_submit_button("登入", type="primary", use_container_width=True,
                                   on_click=cb_login)
+        st.caption("單位帳號 **PICU** (PI-01~PI-25) / **NBC** (NBC-01~NBC-27) 以單位密碼登入,"
+                   "可依床位儲存紀錄;個人帳號請先到「建立帳號」註冊,可自行管理病患。")
     with tab_reg:
         with st.form("acct_register_form", border=False):
             st.text_input("帳號", key="acct_rg_user", help=f"至少 {MIN_LEN} 個字")
@@ -919,7 +950,7 @@ def auth_dialog() -> None:
             st.text_input("再次輸入密碼", type="password", key="acct_rg_pw2")
             st.form_submit_button("建立帳號", type="primary", use_container_width=True,
                                   on_click=cb_register)
-    st.caption("個人帳號與 PICU / NBC 單位登入 (側邊欄) 分開,兩者可同時使用。")
+        st.caption("單位帳號 (PICU / NBC) 不需註冊。")
 
 
 @st.dialog("管理病患")
@@ -959,12 +990,25 @@ def patients_dialog() -> None:
                           on_click=cb_set, args=("confirm_del_patient", p["id"]))
 
 
+@st.dialog("清空床位")
+def clear_bed_dialog(unit: str, bed: str) -> None:
+    rerun_if_requested()
+    show_db_error()
+    n = len(target_records(("unit", unit, bed)))
+    st.warning(f"確定要清空 {unit} · {bed}?"
+               + (f"將刪除 {n} 筆紀錄,無法復原。" if n else "此床尚無紀錄,只會重設畫面。"))
+    c1, c2 = st.columns(2)
+    c1.button("確認清空", type="primary", use_container_width=True,
+              on_click=cb_clear_bed, args=(unit, bed))
+    c2.button("取消", use_container_width=True, on_click=request_app_rerun)
+
+
 @st.dialog("儲存紀錄")
-def save_dialog(pid: int, pname: str, payload: dict) -> None:
+def save_dialog(target: tuple, label: str, payload: dict) -> None:
     rerun_if_requested()
     show_db_error()
     sm = payload.get("summary", {})
-    st.markdown(f"病患:**{pname}**")
+    st.markdown(f"{'床位' if target[0] == 'unit' else '病患'}:**{label}**")
     st.caption(
         f"BW {fmt(payload['bw_g'])} g ｜ TF {sm.get('TF', '—')} ｜ Cal {sm.get('Cal', '—')} ｜ "
         f"SIR {sm.get('SIR', '—')} ｜ AA {sm.get('AA', '—')} ｜ PN {sm.get('PN', '—')} ｜ "
@@ -973,7 +1017,7 @@ def save_dialog(pid: int, pname: str, payload: dict) -> None:
     st.caption(f"Feeding:{sm.get('Feeding', '—')} ｜ IVF:{sm.get('IVF', '—')}")
     st.text_input("備註 (選填)", key="acct_note", max_chars=200, placeholder="例: Day 3 增量")
     st.button("💾 儲存", type="primary", use_container_width=True,
-              on_click=cb_save_record, args=(pid, payload))
+              on_click=cb_save_record, args=(target, payload))
 
 
 def _text_width(text) -> int:
@@ -990,24 +1034,23 @@ def _cell(text, header: bool = False) -> str:
 
 
 @st.dialog("歷史紀錄", width="large")
-def history_dialog(pid: int, pname: str) -> None:
+def history_dialog(target: tuple, label: str) -> None:
     rerun_if_requested()
     show_db_error()
-    st.markdown(f"病患:**{pname}**")
-    recs = acct_list_records(ss.user["id"], pid)
+    st.markdown(f"{'床位' if target[0] == 'unit' else '病患'}:**{label}**")
+    recs = target_records(target)
     if not recs:
         st.caption("尚無紀錄。調整好資料後,按上方「💾 儲存」即可存檔。")
         return
 
     rows = []
-    for rec in recs:
-        d = json.loads(rec["data"])
+    for rid, when, note, d in recs:
         sm = d.get("summary", {})
         rows.append({
-            "_id": rec["id"],
+            "_id": rid,
             "_data": d,
-            "時間": rec["created_at"][:16],
-            "備註": rec["note"] or d.get("bed") or "—",
+            "時間": when,
+            "備註": note or d.get("bed") or "—",
             "BW (g)": fmt(d.get("bw_g", 0)),
             **{k: sm.get(k, "—") for k in SUMMARY_COLS},
         })
@@ -1061,14 +1104,14 @@ def history_dialog(pid: int, pname: str) -> None:
             st.warning(f"確定要刪除 {when} 的紀錄?刪除後無法復原。")
             c1, c2, _ = st.columns([1, 1, 3])
             c1.button("確認刪除", type="primary", key=f"rdel_ok_{rid}",
-                      use_container_width=True, on_click=cb_delete_record, args=(rid,))
+                      use_container_width=True, on_click=cb_delete_record, args=(target, rid))
             c2.button("取消", key=f"rdel_no_{rid}", use_container_width=True,
                       on_click=cb_set, args=("confirm_del_record", None))
 
 
 # --- 標題列 ---
 _ICONS = {"success": "✅", "error": "⚠️", "info": "ℹ️"}
-NOTE_SECONDS = 3  # 一般提示顯示秒數 (有指定秒數者依指定,例如儲存 1 秒)
+NOTE_SECONDS = 3  # 一般提示顯示秒數 (有指定秒數者依指定)
 
 
 def render_notes(notes: list) -> None:
@@ -1098,8 +1141,8 @@ def render_notes(notes: list) -> None:
 
 
 def render_account_header(title_html: str):
-    """標題列 (固定在上方): 左邊標題,右邊個人帳號功能。
-    回傳 (要開啟的對話框, {病患 id: 名稱}, 目前病患 id)。"""
+    """標題列 (固定在上方): 左邊標題,右邊登入 / 床位或病患 / 儲存 / 紀錄 / 帳號。
+    回傳 (要開啟的對話框, {病患 id: 名稱}, 目前病患 id, 單位各床最近紀錄)。"""
     try:
         dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
     except Exception:
@@ -1125,9 +1168,14 @@ def render_account_header(title_html: str):
         .st-key-hdr_ctrl, .st-key-hdr_ctrl [data-testid="stHorizontalBlock"] {{
             overflow: visible !important;
         }}
+        /* 病患選單約 10rem;床位選單含體重與時間,較寬 */
         .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-pat_sel),
         .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-pat_sel) {{
             flex: 0 0 10rem !important; width: 10rem !important;
+        }}
+        .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-bed_box),
+        .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-bed_box) {{
+            flex: 0 0 16rem !important; width: 16rem !important;
         }}
         .st-key-hdr_ctrl button {{ white-space: nowrap; }}
         .st-key-app_header {{
@@ -1143,7 +1191,13 @@ def render_account_header(title_html: str):
     notes = ss.get("acct_flash", [])
     ss.acct_flash = []
 
+    unit = ss.get("unit")
     user = ss.get("user")
+    latest = {}
+    if unit:
+        latest = latest_by_bed(unit)
+        if ss.get("bed_sel") not in UNITS[unit]:
+            ss.bed_sel = UNITS[unit][0]
     patients = {}
     if user:
         patients = {p["id"]: p["name"] for p in acct_list_patients(user["id"])}
@@ -1155,56 +1209,88 @@ def render_account_header(title_html: str):
     pid = ss.get("patient_id") if user else None
     dialog_to_open = None
 
+    def bed_label(bed):
+        if bed in latest:
+            t, d = latest[bed]
+            return f"{bed} ● {d.get('bw_g', 0):g} g · {t[5:]}"
+        return f"{bed} (空床)"
+
     with st.container(key="app_header"):
         h_title, h_ctrl = st.columns([5, 6], vertical_alignment="center")
         h_title.markdown(title_html, unsafe_allow_html=True)
         with h_ctrl.container(key="hdr_ctrl"):
-            # 一排靠右: [提示文字] [病患選單] [儲存] [紀錄] [帳號]
-            if not user:
+            # 一排靠右: [提示文字] [床位 / 病患選單] [儲存] [紀錄] [帳號]
+            if not (unit or user):
                 c_note, c_login = st.columns(2, vertical_alignment="center")
                 with c_note.container(key="notice"):
                     render_notes(notes)
                 if c_login.button("🔑 登入 / 註冊",
-                                  help="個人帳號:登入後可建立病患、儲存與查看歷史紀錄"):
+                                  help="PICU / NBC 單位帳號或個人帳號:登入後可儲存與查看歷史紀錄"):
                     dialog_to_open = "auth"
             else:
-                c_note, c_pat, c_save, c_hist, c_acct = st.columns(
+                c_note, c_sel, c_save, c_hist, c_acct = st.columns(
                     5, vertical_alignment="center")
                 with c_note.container(key="notice"):
                     render_notes(notes)
-                with c_pat.container(key="pat_sel"):
-                    if patients:
-                        st.selectbox("目前病患", list(patients),
-                                     format_func=lambda i: patients[i],
-                                     key="patient_id", on_change=cb_select_patient,
-                                     label_visibility="collapsed")
-                    else:
-                        st.caption("尚無病患")
-                if c_save.button("💾 儲存", disabled=not pid,
-                                 help="把目前輸入的資料存到這位病患"):
+                if unit:
+                    with c_sel.container(key="bed_box"):
+                        st.selectbox("床位", UNITS[unit], key="bed_sel", format_func=bed_label,
+                                     on_change=cb_select_bed, label_visibility="collapsed")
+                    can_save = True
+                else:
+                    with c_sel.container(key="pat_sel"):
+                        if patients:
+                            st.selectbox("目前病患", list(patients),
+                                         format_func=lambda i: patients[i],
+                                         key="patient_id", on_change=cb_select_patient,
+                                         label_visibility="collapsed")
+                        else:
+                            st.caption("尚無病患")
+                    can_save = bool(pid)
+                if c_save.button("💾 儲存", disabled=not can_save,
+                                 help="把目前輸入的資料存到這個" + ("床位" if unit else "病患")):
                     dialog_to_open = "save"
-                if c_hist.button("🕘 紀錄", disabled=not pid,
+                if c_hist.button("🕘 紀錄", disabled=not can_save,
                                  help="查看、載入或刪除歷史紀錄"):
                     dialog_to_open = "history"
-                with c_acct.popover("👤 帳號"):
-                    st.caption(f"登入身分:**{user['username']}**")
-                    if st.button("👥 新增 / 管理病患", use_container_width=True):
-                        dialog_to_open = "patients"
+                with c_acct.popover(f"👤 {unit}" if unit else "👤 帳號"):
+                    if unit:
+                        st.caption(f"單位帳號:**{unit}**")
+                        st.caption(f"儲存位置:{storage_name()}")
+                        if st.button(f"🗑️ 清空 {ss.bed_sel} 資料", use_container_width=True):
+                            dialog_to_open = "clear"
+                    else:
+                        st.caption(f"登入身分:**{user['username']}**")
+                        if st.button("👥 新增 / 管理病患", use_container_width=True):
+                            dialog_to_open = "patients"
                     st.button("🚪 登出", on_click=cb_logout, use_container_width=True)
     show_db_error()
-    return dialog_to_open, patients, pid
+    return dialog_to_open, patients, pid, latest
 
 
 def open_account_dialog(which, patients: dict, pid, payload) -> None:
     """開啟標題列按下的對話框 (放在 main 最後,儲存時才拿得到計算結果)。"""
     if which == "auth":
         auth_dialog()
-    elif which == "patients":
+        return
+    if which == "patients":
         patients_dialog()
-    elif which == "history" and pid:
-        history_dialog(pid, patients[pid])
-    elif which == "save" and pid and payload:
-        save_dialog(pid, patients[pid], payload)
+        return
+    unit = ss.get("unit")
+    if unit:
+        bed = ss.bed_sel
+        target, label = ("unit", unit, bed), f"{unit} · {bed}"
+        if which == "clear":
+            clear_bed_dialog(unit, bed)
+            return
+    elif pid:
+        target, label = ("acct", pid), patients[pid]
+    else:
+        return
+    if which == "save" and payload:
+        save_dialog(target, label, payload)
+    elif which == "history":
+        history_dialog(target, label)
 
 
 def main():
@@ -1239,67 +1325,18 @@ def main():
     for k, v in DEFAULTS.items():
         ss.setdefault(k, v)
 
-    # 標題列 + 個人帳號 (登入 / 病患 / 儲存 / 紀錄)
-    acct_dialog, acct_patients, acct_pid = render_account_header(
+    # 標題列 + 登入 (單位帳號 PICU / NBC 或個人帳號) / 床位或病患 / 儲存 / 紀錄
+    acct_dialog, acct_patients, acct_pid, latest = render_account_header(
         f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
         f"{logo_html}NICU 營養計算器</h1>")
     acct_payload = None
-
-    # --- 登入 / 床位 ---
-    sb = st.sidebar
     unit = ss.get("unit")
-    save_slot = None
-    if unit:
-        beds = UNITS[unit]
-        latest = latest_by_bed(unit)
-        a, b = sb.columns([3, 2])
-        a.markdown(f"**單位:{unit}**")
-        b.button("登出", on_click=do_logout, use_container_width=True)
-        sb.caption(f"儲存位置:{storage_name()}")
 
-        def bed_label(bed):
-            if bed in latest:
-                t, d = latest[bed]
-                return f"{bed} ● {d.get('bw_g', 0):g} g · {t[5:]}"
-            return f"{bed} (空床)"
-
-        sb.selectbox("床位", beds, key="bed_sel", format_func=bed_label,
-                     on_change=load_latest)
-        bed = ss["bed_sel"]
-        recs = list_records(unit, bed)
-        if recs:
-            rec_times = dict(recs)
-            c1, c2 = sb.columns([3, 2])
-            c1.selectbox("歷次紀錄", [r_[0] for r_ in recs], key=f"hist_{unit}_{bed}",
-                         format_func=lambda i: rec_times.get(i, ""),
-                         label_visibility="collapsed")
-            c2.button("載入", on_click=load_selected_history, use_container_width=True)
-        save_slot = sb.container()
-        if ss.get("loaded_info"):
-            sb.caption(ss["loaded_info"])
-        if ss.get("clear_pending") == bed:
-            sb.warning(f"確定要清空 {bed}?"
-                       + (f"將刪除 {len(recs)} 筆紀錄,無法復原。" if recs else "此床尚無紀錄,只會重設畫面。"))
-            c1, c2 = sb.columns(2)
-            c1.button("確認清空", on_click=do_clear_bed, type="primary",
-                      use_container_width=True)
-            c2.button("取消", on_click=cancel_clear_bed, use_container_width=True)
-        else:
-            sb.button(f"🗑️ 清空 {bed} 資料", on_click=ask_clear_bed,
-                      use_container_width=True)
-    else:
-        with sb.expander("🔐 登入 (儲存 / 讀取床位紀錄)"):
-            with st.form("login_form", clear_on_submit=False):
-                st.text_input("帳號 (PICU / NBC)", key="login_user")
-                st.text_input("密碼", type="password", key="login_pw")
-                st.form_submit_button("登入", on_click=do_login, use_container_width=True)
-            if ss.get("login_error"):
-                st.error(ss["login_error"])
+    sb = st.sidebar
+    if not (unit or ss.get("user")):
         sb.caption("未登入也可直接計算,但不會儲存紀錄")
         sb.button("🗑️ 清空輸入 (重設為預設值)", on_click=do_reset_inputs,
                   use_container_width=True)
-    if ss.get("flash"):
-        sb.success(ss.pop("flash"))
 
     # --- 病人資料 ---
     sb.header("病人資料")
@@ -1322,7 +1359,7 @@ def main():
                                  "備註": d.get("bed", ""), **sm})
                 else:
                     rows.append({"床位": b_, "上次儲存": "—"})
-            st.caption(f"{unit} 各床最近一次紀錄 (於側邊欄選擇床位即可載入)")
+            st.caption(f"{unit} 各床最近一次紀錄 (於上方選擇床位即可載入)")
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
                          height=min(40 + 35 * len(rows), 950))
 
@@ -1441,20 +1478,6 @@ def main():
         acct_payload = {k: (to_dec1(ss[k]) if type(DEFAULTS[k]) is float else ss[k])
                         for k in DEFAULTS}
         acct_payload.update(milk_comp=p["milk_comp"], fort_comp=p["fort_comp"], summary=s)
-
-        # --- 儲存 (需登入) ---
-        if save_slot is not None:
-            if save_slot.button(f"💾 儲存 {ss['bed_sel']} 紀錄", type="primary",
-                                use_container_width=True):
-                data = {k: (to_dec1(ss[k]) if type(DEFAULTS[k]) is float else ss[k])
-                        for k in DEFAULTS}
-                data["milk_comp"] = p["milk_comp"]
-                data["fort_comp"] = p["fort_comp"]
-                data["summary"] = s
-                t = save_record(ss["unit"], ss["bed_sel"], data)
-                ss["flash"] = f"已儲存 {ss['bed_sel']} ({t})"
-                ss["loaded_info"] = ""
-                st.rerun()
 
         # --- 頂部摘要 ---
         with top:
