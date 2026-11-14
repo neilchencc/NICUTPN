@@ -774,12 +774,19 @@ def target_records(target: tuple) -> list:
 
 
 # --- callbacks: 登入 / 註冊 / 登出 ---
+PERSONAL = "個人帳號"
+LOGIN_KINDS = list(UNITS) + [PERSONAL]  # 登入選單: PICU / NBC / 個人帳號
+LOGIN_KIND_LABELS = {"PICU": "PICU (單位帳號)", "NBC": "NBC (單位帳號)",
+                     PERSONAL: "個人帳號 (自行管理病患)"}
+
+
 @db_safe
 def cb_login() -> None:
-    name = ss.get("acct_li_user", "").strip()
+    kind = ss.get("acct_li_kind", LOGIN_KINDS[0])
+    name = ss.get("acct_li_user", "").strip() if kind == PERSONAL else kind
     pw = ss.get("acct_li_pw", "")
     ss.acct_li_pw = ""
-    if name.upper() in UNITS:  # 單位帳號 PICU / NBC
+    if name.upper() in UNITS:  # 單位帳號 PICU / NBC (選單選擇,或在個人帳號欄輸入單位名稱)
         unit = name.upper()
         if not check_login(unit, pw):
             ss._acct_auth_err = "帳號或密碼錯誤"
@@ -935,14 +942,21 @@ def auth_dialog() -> None:
         st.error(err)
     tab_login, tab_reg = st.tabs(["登入", "建立帳號"])
     with tab_login:
+        # 選單放在 form 外面,切換時才能立即顯示 / 隱藏帳號欄位
+        kind = st.selectbox("登入類型", LOGIN_KINDS, key="acct_li_kind",
+                            format_func=lambda k: LOGIN_KIND_LABELS.get(k, k))
         with st.form("acct_login_form", border=False):
-            st.text_input("帳號", key="acct_li_user",
-                          help="單位帳號 PICU / NBC (床位紀錄),或自己建立的個人帳號 (病患紀錄)")
-            st.text_input("密碼", type="password", key="acct_li_pw")
+            if kind == PERSONAL:
+                st.text_input("帳號", key="acct_li_user")
+            st.text_input("單位密碼" if kind in UNITS else "密碼", type="password",
+                          key="acct_li_pw")
             st.form_submit_button("登入", type="primary", use_container_width=True,
                                   on_click=cb_login)
-        st.caption("單位帳號 **PICU** (PI-01~PI-25) / **NBC** (NBC-01~NBC-27) 以單位密碼登入,"
-                   "可依床位儲存紀錄;個人帳號請先到「建立帳號」註冊,可自行管理病患。")
+        if kind in UNITS:
+            beds = UNITS[kind]
+            st.caption(f"床位 {beds[0]} – {beds[-1]},依床位儲存紀錄。")
+        else:
+            st.caption("個人帳號請先到「建立帳號」註冊,可自行管理病患。")
     with tab_reg:
         with st.form("acct_register_form", border=False):
             st.text_input("帳號", key="acct_rg_user", help=f"至少 {MIN_LEN} 個字")
