@@ -14,13 +14,23 @@ NICU 營養計算器 (Streamlit)
   儲存位置: secrets 有 [gcp_service_account] 與 [gsheet] 時存到 Google Sheets
   (需 pip install gspread),否則存本機 SQLite (nicu_records.db,環境變數 NICU_DB 可改路徑)。
   密碼可在 .streamlit/secrets.toml 以 [passwords] PICU = "..." 覆寫。
+個人帳號 (移植自 TPN 計算器,與上面的單位登入互相獨立):
+  - 標題旁的按鈕: 登入 / 註冊 (帳號、密碼皆需 4 個字以上,密碼以 PBKDF2 雜湊儲存)
+  - 登入後可選擇病患、儲存、看歷史紀錄 (載入 / 刪除)、新增 / 管理 / 刪除病患
+  - 資料存在 SQLite nicu_accounts.db (環境變數 NICU_ACCT_DB_DIR 可指定資料夾)
+  - 需要 Streamlit >= 1.40 (st.dialog、具 key 的 container)
 執行: streamlit run streamlit_app.py
 """
 import base64
+import functools
+import hashlib
 import hmac
+import html
 import json
 import os
+import secrets
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -561,11 +571,651 @@ def status(ok: bool) -> str:
     return "✅" if ok else "⚠️"
 
 
+# ======================================================================
+# 個人帳號 (移植自 TPN 計算器): 註冊 / 登入、管理病患、儲存、歷史紀錄
+# 與上方 PICU / NBC 單位登入、床位紀錄互相獨立 (那部分完全沒有更動)
+# 資料存在獨立的 SQLite 檔 nicu_accounts.db (環境變數 NICU_ACCT_DB_DIR 可指定資料夾)
+# ======================================================================
+ss = st.session_state
+ACCT_DB_FILENAME = "nicu_accounts.db"
+MIN_LEN = 4  # 帳號、密碼最少字數
+PBKDF2_ROUNDS = 200_000
+SUMMARY_COLS = ["Feeding", "IVF", "AA", "PN", "Fat", "TF", "Cal", "SIR"]
+
+
+def _pick_acct_db_path() -> Path:
+    """找一個可以正常寫入的位置放資料庫 (同 TPN 計算器)。
+    Streamlit Cloud 的程式資料夾可能無法寫入 SQLite,所以優先放家目錄或暫存資料夾。"""
+    candidates = []
+    if os.environ.get("NICU_ACCT_DB_DIR"):
+        candidates.append(Path(os.environ["NICU_ACCT_DB_DIR"]))
+    candidates += [Path.home() / ".nicu_calc", Path(tempfile.gettempdir()) / "nicu_calc",
+                   Path(__file__).parent]
+    for folder in candidates:
+        path = folder / ACCT_DB_FILENAME
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(path)) as c:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute("CREATE TABLE IF NOT EXISTS _write_test (x TEXT)")
+                c.execute("INSERT INTO _write_test VALUES ('ok')")
+                c.rollback()
+            return path
+        except (sqlite3.Error, OSError):
+            continue
+    raise RuntimeError("找不到可寫入的位置來存放帳號資料庫")
+
+
+ACCT_DB_PATH = _pick_acct_db_path()
+
+
+def _acct_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(ACCT_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def acct_init_db() -> None:
+    with closing(_acct_db()) as c, c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                username   TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                pw_hash    TEXT NOT NULL,
+                salt       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS patients (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name       TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (user_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS records (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                note       TEXT,
+                data       TEXT NOT NULL
+            );
+            """
+        )
+
+
+def _now_str() -> str:
+    return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hash_pw(password: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex),
+                               PBKDF2_ROUNDS).hex()
+
+
+def acct_create_user(username: str, password: str):
+    """成功回傳 (user_id, None);失敗回傳 (None, 錯誤訊息)。"""
+    username = username.strip()
+    if len(username) < MIN_LEN:
+        return None, f"帳號至少需要 {MIN_LEN} 個字"
+    if len(password) < MIN_LEN:
+        return None, f"密碼至少需要 {MIN_LEN} 個字"
+    salt = secrets.token_hex(16)
+    try:
+        with closing(_acct_db()) as c, c:
+            cur = c.execute(
+                "INSERT INTO users (username, pw_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+                (username, _hash_pw(password, salt), salt, _now_str()),
+            )
+            return cur.lastrowid, None
+    except sqlite3.IntegrityError:
+        return None, "此帳號已被使用"
+
+
+def acct_verify_user(username: str, password: str):
+    with closing(_acct_db()) as c:
+        row = c.execute("SELECT * FROM users WHERE username = ?", (username.strip(),)).fetchone()
+    if row and hmac.compare_digest(row["pw_hash"], _hash_pw(password, row["salt"])):
+        return {"id": row["id"], "username": row["username"]}
+    return None
+
+
+def acct_list_patients(user_id: int) -> list:
+    with closing(_acct_db()) as c:
+        return c.execute(
+            """SELECT p.id, p.name, COUNT(r.id) AS n FROM patients p
+               LEFT JOIN records r ON r.patient_id = p.id
+               WHERE p.user_id = ? GROUP BY p.id ORDER BY p.created_at, p.id""",
+            (user_id,),
+        ).fetchall()
+
+
+def acct_create_patient(user_id: int, name: str):
+    try:
+        with closing(_acct_db()) as c, c:
+            cur = c.execute("INSERT INTO patients (user_id, name, created_at) VALUES (?, ?, ?)",
+                            (user_id, name, _now_str()))
+            return cur.lastrowid, None
+    except sqlite3.IntegrityError:
+        return None, f"已經有名為「{name}」的病患"
+
+
+def acct_delete_patient(user_id: int, patient_id: int) -> None:
+    with closing(_acct_db()) as c, c:  # 紀錄透過 ON DELETE CASCADE 一併刪除
+        c.execute("DELETE FROM patients WHERE id = ? AND user_id = ?", (patient_id, user_id))
+
+
+def acct_add_record(user_id: int, patient_id: int, note: str, data: dict) -> bool:
+    with closing(_acct_db()) as c, c:
+        owner = c.execute("SELECT 1 FROM patients WHERE id = ? AND user_id = ?",
+                          (patient_id, user_id)).fetchone()
+        if not owner:
+            return False
+        c.execute("INSERT INTO records (patient_id, created_at, note, data) VALUES (?, ?, ?, ?)",
+                  (patient_id, _now_str(), note, json.dumps(data, ensure_ascii=False)))
+        return True
+
+
+def acct_list_records(user_id: int, patient_id: int) -> list:
+    with closing(_acct_db()) as c:
+        return c.execute(
+            """SELECT r.id, r.created_at, r.note, r.data FROM records r
+               JOIN patients p ON p.id = r.patient_id
+               WHERE r.patient_id = ? AND p.user_id = ?
+               ORDER BY r.created_at DESC, r.id DESC""",
+            (patient_id, user_id),
+        ).fetchall()
+
+
+def acct_delete_record(user_id: int, record_id: int) -> None:
+    with closing(_acct_db()) as c, c:
+        c.execute(
+            """DELETE FROM records WHERE id = ? AND patient_id IN
+               (SELECT id FROM patients WHERE user_id = ?)""",
+            (record_id, user_id),
+        )
+
+
+acct_init_db()
+
+
+# --- 狀態輔助 ---
+def acct_flash(kind: str, msg: str, seconds: float = 0) -> None:
+    """記下訊息,下次整頁更新時顯示在標題列。"""
+    ss.setdefault("acct_flash", []).append((kind, msg, seconds))
+
+
+def acct_apply(data: dict) -> None:
+    """排定要載入的輸入值;真正寫入是在下一次整頁執行的最前面 (任何輸入欄位畫出來之前),
+    這樣從對話框按的也能正確更新所有欄位。空 dict = 重設為預設值。"""
+    ss._acct_pending = dict(data)
+
+
+def acct_load_latest(pid: int) -> None:
+    recs = acct_list_records(ss.user["id"], pid)
+    if recs:
+        acct_apply(json.loads(recs[0]["data"]))
+        acct_flash("info", f"已載入最近紀錄 ({recs[0]['created_at'][:16]})")
+    else:
+        acct_apply({})
+
+
+def request_app_rerun() -> None:
+    """對話框裡的 callback 用:之後整頁重新整理並關閉對話框。"""
+    ss._acct_rerun = True
+
+
+def rerun_if_requested() -> None:
+    if ss.pop("_acct_rerun", False):
+        st.rerun()
+
+
+def db_safe(func):
+    """資料庫出錯時不讓整個 app 當掉,改把錯誤訊息顯示在畫面上。"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.Error as e:
+            ss._acct_db_err = f"資料庫錯誤 ({type(e).__name__}):{e}\n\n資料庫位置:{ACCT_DB_PATH}"
+    return wrapper
+
+
+def show_db_error() -> None:
+    err = ss.pop("_acct_db_err", None)
+    if err:
+        st.error(err)
+
+
+# --- callbacks: 帳號 ---
+@db_safe
+def cb_login() -> None:
+    user = acct_verify_user(ss.get("acct_li_user", ""), ss.get("acct_li_pw", ""))
+    if not user:
+        ss._acct_auth_err = "帳號或密碼錯誤"
+        return
+    ss.user = user
+    ss.acct_li_pw = ""
+    plist = acct_list_patients(user["id"])
+    if plist:
+        ss.patient_id = plist[0]["id"]
+        acct_load_latest(plist[0]["id"])
+    acct_flash("success", f"歡迎,{user['username']}")
+    request_app_rerun()
+
+
+@db_safe
+def cb_register() -> None:
+    u, p, p2 = ss.get("acct_rg_user", ""), ss.get("acct_rg_pw", ""), ss.get("acct_rg_pw2", "")
+    if p != p2:
+        ss._acct_auth_err = "兩次輸入的密碼不一致"
+        return
+    uid, err = acct_create_user(u, p)
+    if err:
+        ss._acct_auth_err = err
+        return
+    ss.user = {"id": uid, "username": u.strip()}
+    ss.acct_rg_pw = ss.acct_rg_pw2 = ""
+    acct_flash("success", "帳號已建立,請新增第一位病患")
+    request_app_rerun()
+
+
+def cb_logout() -> None:
+    for k in ["user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
+        ss.pop(k, None)
+    acct_apply({})
+    acct_flash("info", "已登出")
+
+
+# --- callbacks: 病患 ---
+@db_safe
+def cb_select_patient() -> None:
+    acct_load_latest(ss.patient_id)
+
+
+@db_safe
+def cb_add_patient() -> None:
+    name = ss.get("acct_new_patient", "").strip()
+    if not name:
+        ss._acct_pat_err = "請輸入病患名稱"
+        return
+    pid, err = acct_create_patient(ss.user["id"], name)
+    if err:
+        ss._acct_pat_err = err
+        return
+    ss.patient_id = pid
+    ss.acct_new_patient = ""
+    acct_apply({})  # 新病患從預設值開始
+    acct_flash("success", f"已新增病患「{name}」")
+    request_app_rerun()
+
+
+@db_safe
+def cb_choose_patient(pid: int) -> None:
+    ss.patient_id = pid
+    acct_load_latest(pid)
+    request_app_rerun()
+
+
+@db_safe
+def cb_delete_patient(pid: int, name: str) -> None:
+    acct_delete_patient(ss.user["id"], pid)
+    ss.pop("confirm_del_patient", None)
+    if ss.get("patient_id") == pid:
+        ss.pop("patient_id", None)
+    acct_flash("success", f"已刪除病患「{name}」及其紀錄")
+    request_app_rerun()
+
+
+# --- callbacks: 紀錄 ---
+@db_safe
+def cb_save_record(pid: int, payload: dict) -> None:
+    note = ss.get("acct_note", "").strip()
+    if acct_add_record(ss.user["id"], pid, note, payload):
+        ss.acct_note = ""
+        acct_flash("success", "已儲存紀錄", seconds=1)
+    else:
+        acct_flash("error", "儲存失敗:找不到此病患")
+    request_app_rerun()
+
+
+@db_safe
+def cb_load_record(data: dict, created_at: str) -> None:
+    acct_apply(data)
+    acct_flash("info", f"已載入 {created_at} 的紀錄")
+    request_app_rerun()
+
+
+@db_safe
+def cb_delete_record(rid: int) -> None:
+    acct_delete_record(ss.user["id"], rid)
+    ss.pop("confirm_del_record", None)  # 對話框保持開啟,可以繼續刪
+
+
+def cb_set(key: str, value) -> None:
+    ss[key] = value
+
+
+# --- 對話框 ---
+@st.dialog("登入 / 註冊")
+def auth_dialog() -> None:
+    rerun_if_requested()
+    show_db_error()
+    err = ss.pop("_acct_auth_err", None)
+    if err:
+        st.error(err)
+    tab_login, tab_reg = st.tabs(["登入", "建立帳號"])
+    with tab_login:
+        with st.form("acct_login_form", border=False):
+            st.text_input("帳號", key="acct_li_user")
+            st.text_input("密碼", type="password", key="acct_li_pw")
+            st.form_submit_button("登入", type="primary", use_container_width=True,
+                                  on_click=cb_login)
+    with tab_reg:
+        with st.form("acct_register_form", border=False):
+            st.text_input("帳號", key="acct_rg_user", help=f"至少 {MIN_LEN} 個字")
+            st.text_input("密碼", type="password", key="acct_rg_pw", help=f"至少 {MIN_LEN} 個字")
+            st.text_input("再次輸入密碼", type="password", key="acct_rg_pw2")
+            st.form_submit_button("建立帳號", type="primary", use_container_width=True,
+                                  on_click=cb_register)
+    st.caption("個人帳號與 PICU / NBC 單位登入 (側邊欄) 分開,兩者可同時使用。")
+
+
+@st.dialog("管理病患")
+def patients_dialog() -> None:
+    rerun_if_requested()
+    show_db_error()
+    with st.form("acct_new_patient_form", border=False):
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        c1.text_input("新增病患", key="acct_new_patient", max_chars=50,
+                      placeholder="例: 床號 / 代號 (請勿輸入姓名、病歷號)")
+        c2.form_submit_button("新增", type="primary", use_container_width=True,
+                              on_click=cb_add_patient)
+    err = ss.pop("_acct_pat_err", None)
+    if err:
+        st.error(err)
+
+    st.divider()
+    plist = acct_list_patients(ss.user["id"])
+    if not plist:
+        st.caption("尚無病患")
+    for p in plist:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([3, 1.3, 1.3], vertical_alignment="center")
+            current = "　✅ 目前" if p["id"] == ss.get("patient_id") else ""
+            c1.markdown(f"**{p['name']}**{current}  \n{p['n']} 筆紀錄")
+            if ss.get("confirm_del_patient") == p["id"]:
+                c2.button("確認刪除", type="primary", key=f"pdel_ok_{p['id']}",
+                          use_container_width=True,
+                          on_click=cb_delete_patient, args=(p["id"], p["name"]))
+                c3.button("取消", key=f"pdel_no_{p['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_patient", None))
+                st.warning(f"將刪除「{p['name']}」及其 {p['n']} 筆紀錄,無法復原。")
+            else:
+                c2.button("選擇", key=f"psel_{p['id']}", use_container_width=True,
+                          on_click=cb_choose_patient, args=(p["id"],))
+                c3.button("🗑 刪除", key=f"pdel_{p['id']}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_patient", p["id"]))
+
+
+@st.dialog("儲存紀錄")
+def save_dialog(pid: int, pname: str, payload: dict) -> None:
+    rerun_if_requested()
+    show_db_error()
+    sm = payload.get("summary", {})
+    st.markdown(f"病患:**{pname}**")
+    st.caption(
+        f"BW {fmt(payload['bw_g'])} g ｜ TF {sm.get('TF', '—')} ｜ Cal {sm.get('Cal', '—')} ｜ "
+        f"SIR {sm.get('SIR', '—')} ｜ AA {sm.get('AA', '—')} ｜ PN {sm.get('PN', '—')} ｜ "
+        f"Fat {sm.get('Fat', '—')}"
+    )
+    st.caption(f"Feeding:{sm.get('Feeding', '—')} ｜ IVF:{sm.get('IVF', '—')}")
+    st.text_input("備註 (選填)", key="acct_note", max_chars=200, placeholder="例: Day 3 增量")
+    st.button("💾 儲存", type="primary", use_container_width=True,
+              on_click=cb_save_record, args=(pid, payload))
+
+
+def _text_width(text) -> int:
+    """估計文字寬度:中文等全形字算 2,英數算 1。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
+
+
+def _cell(text, header: bool = False) -> str:
+    weight = "font-weight:600;" if header else ""
+    height = "2rem" if header else "2.5rem"
+    return (f"<div style='display:flex; align-items:center; justify-content:center; "
+            f"min-height:{height}; text-align:center; {weight} font-size:0.9rem; "
+            f"line-height:1.3; word-break:break-word;'>{html.escape(str(text))}</div>")
+
+
+@st.dialog("歷史紀錄", width="large")
+def history_dialog(pid: int, pname: str) -> None:
+    rerun_if_requested()
+    show_db_error()
+    st.markdown(f"病患:**{pname}**")
+    recs = acct_list_records(ss.user["id"], pid)
+    if not recs:
+        st.caption("尚無紀錄。調整好資料後,按上方「💾 儲存」即可存檔。")
+        return
+
+    rows = []
+    for rec in recs:
+        d = json.loads(rec["data"])
+        sm = d.get("summary", {})
+        rows.append({
+            "_id": rec["id"],
+            "_data": d,
+            "時間": rec["created_at"][:16],
+            "備註": rec["note"] or d.get("bed") or "—",
+            "BW (g)": fmt(d.get("bw_g", 0)),
+            **{k: sm.get(k, "—") for k in SUMMARY_COLS},
+        })
+    cols = [c for c in rows[0] if not c.startswith("_")]
+    # 欄寬 = 欄名與內容中最寬者 (上限 28,過長自動換行;按鈕欄固定寬度)
+    widths = [5, 5] + [
+        min(28, max(_text_width(c), *(_text_width(r[c]) for r in rows)) + 2) for c in cols
+    ]
+
+    st.markdown(
+        """
+        <style>
+        [class*="st-key-hrow_"] {
+            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+            padding: 0.3rem 0;
+        }
+        .st-key-hrow_header { border-bottom-width: 2px; }
+        [class*="st-key-hrow_"] [data-testid="stMarkdown"],
+        [class*="st-key-hrow_"] [data-testid="stMarkdownContainer"],
+        [class*="st-key-hrow_"] .stMarkdown { margin: 0 !important; }
+        [class*="st-key-hrow_"] p { margin: 0 !important; }
+        [class*="st-key-hrow_"] button { min-height: 2.5rem; padding: 0 0.25rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(key="hrow_header"):
+        hdr = st.columns(widths, gap="small", vertical_alignment="center")
+        for c, name in zip(hdr, ["載入", "刪除"] + cols):
+            c.markdown(_cell(name, header=True), unsafe_allow_html=True)
+
+    for r in rows:
+        rid = r["_id"]
+        with st.container(key=f"hrow_{rid}"):
+            cells = st.columns(widths, gap="small", vertical_alignment="center")
+            cells[0].button("📥", key=f"rload_{rid}", use_container_width=True,
+                            help="載入這筆資料到計算器",
+                            on_click=cb_load_record, args=(r["_data"], r["時間"]))
+            cells[1].button("🗑", key=f"rdel_{rid}", use_container_width=True,
+                            help="刪除這筆紀錄",
+                            on_click=cb_set, args=("confirm_del_record", rid))
+            for c, name in zip(cells[2:], cols):
+                c.markdown(_cell(r[name]), unsafe_allow_html=True)
+
+    rid = ss.get("confirm_del_record")
+    ids = [r["_id"] for r in rows]
+    if rid in ids:
+        when = rows[ids.index(rid)]["時間"]
+        with st.container(border=True):
+            st.warning(f"確定要刪除 {when} 的紀錄?刪除後無法復原。")
+            c1, c2, _ = st.columns([1, 1, 3])
+            c1.button("確認刪除", type="primary", key=f"rdel_ok_{rid}",
+                      use_container_width=True, on_click=cb_delete_record, args=(rid,))
+            c2.button("取消", key=f"rdel_no_{rid}", use_container_width=True,
+                      on_click=cb_set, args=("confirm_del_record", None))
+
+
+# --- 標題列 ---
+_ICONS = {"success": "✅", "error": "⚠️", "info": "ℹ️"}
+NOTE_SECONDS = 3  # 一般提示顯示秒數 (有指定秒數者依指定,例如儲存 1 秒)
+
+
+def render_notes(notes: list) -> None:
+    """在目前位置顯示提示文字 (靠右對齊),數秒後淡出。"""
+    parts = []
+    for kind, msg, sec in notes:
+        ss._note_n = ss.get("_note_n", 0) + 1  # 每次用新的動畫名稱,確保動畫重新播放
+        anim = f"nicuFade{ss._note_n}"
+        fg, bg = ("#b42318", "#fde4e1") if kind == "error" else ("#177233", "#dff3e4")
+        parts.append(
+            f"<style>@keyframes {anim} {{ 0%, 85% {{ opacity: 1; }} "
+            f"100% {{ opacity: 0; visibility: hidden; }} }}</style>"
+            f"<span style='display:inline-block; padding:0.35rem 0.8rem; "
+            f"border-radius:0.5rem; font-size:0.9rem; font-weight:600; "
+            f"white-space:normal; text-align:right; "
+            f"color:{fg}; background:{bg}; animation:{anim} {sec or NOTE_SECONDS}s forwards;'>"
+            f"{_ICONS.get(kind, '')} {html.escape(msg)}</span>"
+        )
+    st.markdown(
+        "<div style='position:relative; min-height:2.5rem;'>"
+        "<div style='position:absolute; right:0; top:50%; transform:translateY(-50%); "
+        "z-index:1000; width:max-content; max-width:min(32rem, 45vw); "
+        "display:flex; flex-direction:column; align-items:flex-end; gap:0.25rem;'>"
+        + "".join(parts) + "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_account_header(title_html: str):
+    """標題列 (固定在上方): 左邊標題,右邊個人帳號功能。
+    回傳 (要開啟的對話框, {病患 id: 名稱}, 目前病患 id)。"""
+    try:
+        dark = st.context.theme.type == "dark"  # Streamlit >= 1.46
+    except Exception:
+        dark = False
+    st.markdown(
+        f"""
+        <style>
+        .st-key-hdr_ctrl [data-testid="stHorizontalBlock"] {{
+            flex-wrap: nowrap !important; justify-content: flex-end;
+            align-items: center; gap: 0.5rem;
+        }}
+        .st-key-hdr_ctrl [data-testid="stColumn"],
+        .st-key-hdr_ctrl [data-testid="column"] {{
+            flex: 0 0 auto !important; width: auto !important; min-width: 0 !important;
+        }}
+        .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-notice),
+        .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-notice) {{
+            flex: 1 1 auto !important; min-width: 0 !important; overflow: visible !important;
+        }}
+        .st-key-notice, .st-key-notice [data-testid="stElementContainer"],
+        .st-key-notice [data-testid="stMarkdown"],
+        .st-key-notice [data-testid="stMarkdownContainer"],
+        .st-key-hdr_ctrl, .st-key-hdr_ctrl [data-testid="stHorizontalBlock"] {{
+            overflow: visible !important;
+        }}
+        .st-key-hdr_ctrl [data-testid="stColumn"]:has(.st-key-pat_sel),
+        .st-key-hdr_ctrl [data-testid="column"]:has(.st-key-pat_sel) {{
+            flex: 0 0 10rem !important; width: 10rem !important;
+        }}
+        .st-key-hdr_ctrl button {{ white-space: nowrap; }}
+        .st-key-app_header {{
+            position: sticky; top: 0; z-index: 999;
+            background-color: {"#0e1117" if dark else "#ffffff"};
+            padding-bottom: 0.25rem;
+            border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    notes = ss.get("acct_flash", [])
+    ss.acct_flash = []
+
+    user = ss.get("user")
+    patients = {}
+    if user:
+        patients = {p["id"]: p["name"] for p in acct_list_patients(user["id"])}
+        if ss.get("patient_id") not in patients:
+            if patients:
+                ss.patient_id = next(iter(patients))
+            else:
+                ss.pop("patient_id", None)
+    pid = ss.get("patient_id") if user else None
+    dialog_to_open = None
+
+    with st.container(key="app_header"):
+        h_title, h_ctrl = st.columns([5, 6], vertical_alignment="center")
+        h_title.markdown(title_html, unsafe_allow_html=True)
+        with h_ctrl.container(key="hdr_ctrl"):
+            # 一排靠右: [提示文字] [病患選單] [儲存] [紀錄] [帳號]
+            if not user:
+                c_note, c_login = st.columns(2, vertical_alignment="center")
+                with c_note.container(key="notice"):
+                    render_notes(notes)
+                if c_login.button("🔑 登入 / 註冊",
+                                  help="個人帳號:登入後可建立病患、儲存與查看歷史紀錄"):
+                    dialog_to_open = "auth"
+            else:
+                c_note, c_pat, c_save, c_hist, c_acct = st.columns(
+                    5, vertical_alignment="center")
+                with c_note.container(key="notice"):
+                    render_notes(notes)
+                with c_pat.container(key="pat_sel"):
+                    if patients:
+                        st.selectbox("目前病患", list(patients),
+                                     format_func=lambda i: patients[i],
+                                     key="patient_id", on_change=cb_select_patient,
+                                     label_visibility="collapsed")
+                    else:
+                        st.caption("尚無病患")
+                if c_save.button("💾 儲存", disabled=not pid,
+                                 help="把目前輸入的資料存到這位病患"):
+                    dialog_to_open = "save"
+                if c_hist.button("🕘 紀錄", disabled=not pid,
+                                 help="查看、載入或刪除歷史紀錄"):
+                    dialog_to_open = "history"
+                with c_acct.popover("👤 帳號"):
+                    st.caption(f"登入身分:**{user['username']}**")
+                    if st.button("👥 新增 / 管理病患", use_container_width=True):
+                        dialog_to_open = "patients"
+                    st.button("🚪 登出", on_click=cb_logout, use_container_width=True)
+    show_db_error()
+    return dialog_to_open, patients, pid
+
+
+def open_account_dialog(which, patients: dict, pid, payload) -> None:
+    """開啟標題列按下的對話框 (放在 main 最後,儲存時才拿得到計算結果)。"""
+    if which == "auth":
+        auth_dialog()
+    elif which == "patients":
+        patients_dialog()
+    elif which == "history" and pid:
+        history_dialog(pid, patients[pid])
+    elif which == "save" and pid and payload:
+        save_dialog(pid, patients[pid], payload)
+
+
 def main():
     _logo = Path(__file__).parent / "logo.png"
     st.set_page_config(page_title="NICU 營養計算器",
                        page_icon=str(_logo) if _logo.exists() else "🍼", layout="wide",
                        initial_sidebar_state="expanded")
+    # 個人帳號: 套用上一個動作排定的輸入值 (必須在任何輸入欄位建立之前)
+    st.session_state.pop("_acct_rerun", None)
+    if "_acct_pending" in st.session_state:
+        apply_record(st.session_state.pop("_acct_pending"))
     st.markdown(
         """
         <style>
@@ -585,15 +1235,15 @@ def main():
         logo_b64 = base64.b64encode(_logo.read_bytes()).decode()
         logo_html = (f"<img src='data:image/png;base64,{logo_b64}' "
                      "style='height:64px; vertical-align:middle; margin-right:12px;'>")
-    st.markdown(
-        f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
-        f"{logo_html}NICU 營養計算器</h1>",
-        unsafe_allow_html=True,
-    )
-
     ss = st.session_state
     for k, v in DEFAULTS.items():
         ss.setdefault(k, v)
+
+    # 標題列 + 個人帳號 (登入 / 病患 / 儲存 / 紀錄)
+    acct_dialog, acct_patients, acct_pid = render_account_header(
+        f"<h1 style='margin-bottom:0; display:flex; align-items:center; flex-wrap:wrap;'>"
+        f"{logo_html}NICU 營養計算器</h1>")
+    acct_payload = None
 
     # --- 登入 / 床位 ---
     sb = st.sidebar
@@ -787,6 +1437,11 @@ def main():
         r = calc_nicu(p)
         s = summary_strings(p, r)
 
+        # 個人帳號儲存用的資料 (格式與床位紀錄相同)
+        acct_payload = {k: (to_dec1(ss[k]) if type(DEFAULTS[k]) is float else ss[k])
+                        for k in DEFAULTS}
+        acct_payload.update(milk_comp=p["milk_comp"], fort_comp=p["fort_comp"], summary=s)
+
         # --- 儲存 (需登入) ---
         if save_slot is not None:
             if save_slot.button(f"💾 儲存 {ss['bed_sel']} 紀錄", type="primary",
@@ -806,6 +1461,8 @@ def main():
             if unit:
                 st.markdown(f"#### 🛏️ {unit} · {ss['bed_sel']}"
                             + (f" — {ss['bed']}" if ss["bed"] else ""))
+            if acct_pid:
+                st.markdown(f"#### 👤 {acct_patients[acct_pid]}")
             m = st.columns(5)
             m[0].metric("TF (mL/kg/day)", f"{r['tf']:.0f}")
             m[1].metric("Cal* (kcal/kg/day)", f"{r['cal']:.1f}")
@@ -994,6 +1651,9 @@ def main():
 
     st.caption("※ 本工具僅供輔助計算,實際處方請由臨床醫師/營養師確認。")
     st.caption("Neil JJC HMMCH 製作")
+
+    # 開啟標題列按下的對話框 (放最後,儲存時才拿得到計算結果)
+    open_account_dialog(acct_dialog, acct_patients, acct_pid, acct_payload)
 
 
 if __name__ == "__main__":
