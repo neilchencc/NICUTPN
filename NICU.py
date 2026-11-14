@@ -11,6 +11,8 @@ NICU 營養計算器 (Streamlit)
 另含「RI 計算」與參考表 (IVF、本院 PN 套餐、奶水成分)。
 登入 (選用): 帳號 PICU (床位 PI-01~PI-25) / NBC (床位 NBC-01~NBC-27),
   在標題列「登入 / 註冊」登入後,可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
+  各單位可新增自訂床位 (只有自訂床位可刪除,刪除時連同紀錄);
+  自訂床位存在 SQLite 的 custom_beds 表,或 Google Sheets 的 beds 工作表。
   儲存位置: secrets 有 [gcp_service_account] 與 [gsheet] 時存到 Google Sheets
   (需 pip install gspread),否則存本機 SQLite (nicu_records.db,環境變數 NICU_DB 可改路徑)。
   密碼可在 .streamlit/secrets.toml 以 [passwords] PICU = "..." 覆寫。
@@ -28,6 +30,7 @@ import hmac
 import html
 import json
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -254,6 +257,93 @@ def clear_bed(unit: str, bed: str):
     else:
         with closing(_db()) as con, con:
             con.execute("DELETE FROM records WHERE unit=? AND bed=?", (unit, bed))
+
+
+# --- 自訂床位 (各單位可新增;只有自訂床位可以刪除,預設床位固定) ---
+GSHEET_BEDS_TAB = "beds"
+GSHEET_BEDS_HEADER = ["unit", "bed", "created_at"]
+BED_MAX_LEN = 20
+
+
+@st.cache_resource(show_spinner=False)
+def _gsheet_beds_ws():
+    import gspread
+    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    cfg = st.secrets["gsheet"]
+    sh = gc.open_by_url(cfg["url"]) if "url" in cfg else gc.open_by_key(cfg["key"])
+    try:
+        ws = sh.worksheet(GSHEET_BEDS_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=GSHEET_BEDS_TAB, rows=200, cols=len(GSHEET_BEDS_HEADER))
+        ws.append_row(GSHEET_BEDS_HEADER)
+    return ws
+
+
+@st.cache_data(ttl=GSHEET_CACHE_TTL, show_spinner=False)
+def _gsheet_beds() -> list:
+    """[(sheet 列號, unit, bed), ...]"""
+    values = _gsheet_beds_ws().get_all_values()
+    return [(i, v[0], v[1]) for i, v in enumerate(values[1:], start=2)
+            if len(v) >= 2 and v[0] and v[1]]
+
+
+def _beds_db() -> sqlite3.Connection:
+    con = _db()
+    con.execute("""CREATE TABLE IF NOT EXISTS custom_beds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        unit TEXT NOT NULL, bed TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE (unit, bed))""")
+    return con
+
+
+def custom_beds(unit: str) -> list:
+    """該單位自訂床位 (依新增順序)。"""
+    if use_gsheets():
+        return [b for _, u, b in _gsheet_beds() if u == unit]
+    with closing(_beds_db()) as con:
+        return [r[0] for r in con.execute(
+            "SELECT bed FROM custom_beds WHERE unit=? ORDER BY id", (unit,))]
+
+
+def all_beds(unit: str) -> list:
+    return UNITS[unit] + custom_beds(unit)
+
+
+def add_custom_bed(unit: str, bed: str):
+    """成功回傳 None,失敗回傳錯誤訊息。"""
+    bed = bed.strip()
+    if not bed:
+        return "請輸入床位名稱"
+    if len(bed) > BED_MAX_LEN:
+        return f"床位名稱最多 {BED_MAX_LEN} 個字"
+    if bed.upper() in (b.upper() for b in all_beds(unit)):
+        return f"已經有床位「{bed}」"
+    now = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+    if use_gsheets():
+        _gsheet_beds_ws().append_row([unit, bed, now], value_input_option="RAW")
+        _gsheet_beds.clear()
+    else:
+        with closing(_beds_db()) as con, con:
+            con.execute("INSERT INTO custom_beds (unit, bed, created_at) VALUES (?, ?, ?)",
+                        (unit, bed, now))
+    return None
+
+
+def delete_custom_bed(unit: str, bed: str) -> None:
+    """刪除自訂床位及其所有紀錄;預設床位不會被刪除。"""
+    if bed in UNITS[unit]:
+        return
+    clear_bed(unit, bed)
+    if use_gsheets():
+        _gsheet_beds.clear()
+        targets = [r for r, u, b in _gsheet_beds() if u == unit and b == bed]
+        ws = _gsheet_beds_ws()
+        for r in sorted(targets, reverse=True):
+            ws.delete_rows(r)
+        _gsheet_beds.clear()
+    else:
+        with closing(_beds_db()) as con, con:
+            con.execute("DELETE FROM custom_beds WHERE unit=? AND bed=?", (unit, bed))
 
 
 def delete_unit_record(unit: str, rec_id: int):
@@ -530,7 +620,42 @@ ss = st.session_state
 ACCT_DB_FILENAME = "nicu_accounts.db"
 MIN_LEN = 4  # 帳號、密碼最少字數
 PBKDF2_ROUNDS = 200_000
-SUMMARY_COLS = ["Feeding", "IVF", "AA", "PN", "Fat", "TF", "Cal", "SIR"]
+
+
+def _history_cols(d: dict) -> dict:
+    """歷史紀錄的資料欄 (順序: Feeding、PN、IVF、TF、Cal、SIR、AA、Fat)。
+    數值取自已存的「今日結果」字串,舊紀錄也能顯示:
+      AA「PN AA/總蛋白」、PN「速率(Glu/AA/AA%TC)」、Fat「mL(g/kg/Fat%TC)」。"""
+    sm = d.get("summary", {})
+
+    def num_at(text: str, pattern: str):
+        m = re.search(pattern, text or "")
+        try:
+            return float(m.group(1)) if m else None
+        except ValueError:
+            return None
+
+    def gkg_pct(gkg, pct) -> str:
+        if gkg is None:
+            return "—"
+        return f"{gkg:.2f} ({pct:.1f}%)" if pct is not None else f"{gkg:.2f}"
+
+    has_pn = bool(d.get("pn_rate"))
+    has_fat = bool(d.get("fat_ml"))
+    aa_gkg = num_at(sm.get("AA"), r"^\s*([^/]+)/")             # PN AA g/kg/day
+    aa_pct = num_at(sm.get("PN"), r"/([^/()]+)\)\s*$")          # AA 占 TC %
+    fat_gkg = num_at(sm.get("Fat"), r"\(([^/()]+)/")            # Fat g/kg/day
+    fat_pct = num_at(sm.get("Fat"), r"/([^/()]+)\)\s*$")        # Fat 占 TC %
+    return {
+        "Feeding": sm.get("Feeding", "—"),
+        "PN": f"{fmt(d.get('pn_glu', 0))}% / {fmt(d.get('pn_aa', 0))}%" if has_pn else "—",
+        "IVF": sm.get("IVF", "—"),
+        "TF": sm.get("TF", "—"),
+        "Cal": sm.get("Cal", "—"),
+        "SIR": sm.get("SIR", "—"),
+        "AA": gkg_pct(aa_gkg, aa_pct) if has_pn else "—",
+        "Fat": gkg_pct(fat_gkg, fat_pct) if has_fat else "—",
+    }
 
 
 def _pick_acct_db_path() -> Path:
@@ -742,7 +867,8 @@ def show_db_error() -> None:
 # --- 登入狀態 ---
 # 單位帳號 (PICU / NBC): ss.unit + ss.bed_sel (床位);個人帳號: ss.user + ss.patient_id (病患)
 def _clear_login() -> None:
-    for k in ["unit", "user", "patient_id", "confirm_del_patient", "confirm_del_record"]:
+    for k in ["unit", "user", "patient_id", "confirm_del_patient", "confirm_del_record",
+              "confirm_del_bed"]:
         ss.pop(k, None)
 
 
@@ -856,6 +982,34 @@ def cb_clear_bed(unit: str, bed: str) -> None:
 
 
 @db_safe
+def cb_add_bed() -> None:
+    unit = ss.unit
+    bed = ss.get("acct_new_bed", "").strip()
+    err = add_custom_bed(unit, bed)
+    if err:
+        ss._acct_bed_err = err
+        return
+    ss.acct_new_bed = ""
+    ss.bed_sel = bed
+    acct_apply({})  # 新床位從預設值開始
+    acct_flash("success", f"已新增床位 {bed}")
+    request_app_rerun()
+
+
+@db_safe
+def cb_delete_bed(bed: str) -> None:
+    unit = ss.unit
+    n = len(target_records(("unit", unit, bed)))
+    delete_custom_bed(unit, bed)
+    ss.pop("confirm_del_bed", None)
+    if ss.get("bed_sel") == bed:
+        ss.bed_sel = UNITS[unit][0]
+        _unit_load_latest()
+    acct_flash("success", f"已刪除床位 {bed}" + (f" 及 {n} 筆紀錄" if n else ""))
+    request_app_rerun()
+
+
+@db_safe
 def cb_select_patient() -> None:
     acct_load_latest(ss.patient_id)
 
@@ -954,7 +1108,7 @@ def auth_dialog() -> None:
                                   on_click=cb_login)
         if kind in UNITS:
             beds = UNITS[kind]
-            st.caption(f"床位 {beds[0]} – {beds[-1]},依床位儲存紀錄。")
+            st.caption(f"床位 {beds[0]} – {beds[-1]} 及自訂床位,依床位儲存紀錄。")
         else:
             st.caption("個人帳號請先到「建立帳號」註冊,可自行管理病患。")
     with tab_reg:
@@ -1002,6 +1156,45 @@ def patients_dialog() -> None:
                           on_click=cb_choose_patient, args=(p["id"],))
                 c3.button("🗑 刪除", key=f"pdel_{p['id']}", use_container_width=True,
                           on_click=cb_set, args=("confirm_del_patient", p["id"]))
+
+
+@st.dialog("新增 / 管理床位")
+def beds_dialog(unit: str) -> None:
+    rerun_if_requested()
+    show_db_error()
+    with st.form("acct_new_bed_form", border=False):
+        c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+        c1.text_input(f"新增 {unit} 床位", key="acct_new_bed", max_chars=BED_MAX_LEN,
+                      placeholder="例: 加床-1 (請勿輸入姓名、病歷號)")
+        c2.form_submit_button("新增", type="primary", use_container_width=True,
+                              on_click=cb_add_bed)
+    err = ss.pop("_acct_bed_err", None)
+    if err:
+        st.error(err)
+    fixed = UNITS[unit]
+    st.caption(f"預設床位 {fixed[0]} – {fixed[-1]} (共 {len(fixed)} 床) 固定,不可刪除;"
+               "只有自訂床位可以刪除。")
+
+    st.divider()
+    beds = custom_beds(unit)
+    if not beds:
+        st.caption("尚無自訂床位")
+    for bed in beds:
+        n = len(target_records(("unit", unit, bed)))
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([3, 1.3, 1.3], vertical_alignment="center")
+            current = "　✅ 目前" if bed == ss.get("bed_sel") else ""
+            c1.markdown(f"**{bed}**{current}  \n{n} 筆紀錄")
+            if ss.get("confirm_del_bed") == bed:
+                c2.button("確認刪除", type="primary", key=f"bdel_ok_{bed}",
+                          use_container_width=True, on_click=cb_delete_bed, args=(bed,))
+                c3.button("取消", key=f"bdel_no_{bed}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_bed", None))
+                st.warning(f"將刪除床位「{bed}」" + (f"及其 {n} 筆紀錄" if n else "")
+                           + ",無法復原。")
+            else:
+                c3.button("🗑 刪除", key=f"bdel_{bed}", use_container_width=True,
+                          on_click=cb_set, args=("confirm_del_bed", bed))
 
 
 @st.dialog("清空床位")
@@ -1059,14 +1252,13 @@ def history_dialog(target: tuple, label: str) -> None:
 
     rows = []
     for rid, when, note, d in recs:
-        sm = d.get("summary", {})
         rows.append({
             "_id": rid,
             "_data": d,
             "時間": when,
             "備註": note or d.get("bed") or "—",
             "BW (g)": fmt(d.get("bw_g", 0)),
-            **{k: sm.get(k, "—") for k in SUMMARY_COLS},
+            **_history_cols(d),
         })
     cols = [c for c in rows[0] if not c.startswith("_")]
     # 欄寬 = 欄名與內容中最寬者 (上限 28,過長自動換行;按鈕欄固定寬度)
@@ -1109,6 +1301,13 @@ def history_dialog(target: tuple, label: str) -> None:
                             on_click=cb_set, args=("confirm_del_record", rid))
             for c, name in zip(cells[2:], cols):
                 c.markdown(_cell(r[name]), unsafe_allow_html=True)
+
+    st.caption(
+        "**單位**:BW g ｜ Feeding 每餐 mL、q 小時 ｜ PN Glucose % / AA % ｜ "
+        "IVF 速率 mL/hr ｜ TF mL/kg/day ｜ Cal kcal/kg/day (吃 + 打) ｜ SIR mg/kg/min ｜ "
+        "AA PN 胺基酸 g/kg/day (占 TC %) ｜ Fat IF 20% 脂肪 g/kg/day (占 TC %)  \n"
+        "TC (總熱量) 只計 PN + IVF + Fat,不含奶水。"
+    )
 
     rid = ss.get("confirm_del_record")
     ids = [r["_id"] for r in rows]
@@ -1210,7 +1409,8 @@ def render_account_header(title_html: str):
     latest = {}
     if unit:
         latest = latest_by_bed(unit)
-        if ss.get("bed_sel") not in UNITS[unit]:
+        beds = all_beds(unit)  # 預設床位 + 自訂床位
+        if ss.get("bed_sel") not in beds:
             ss.bed_sel = UNITS[unit][0]
     patients = {}
     if user:
@@ -1248,7 +1448,7 @@ def render_account_header(title_html: str):
                     render_notes(notes)
                 if unit:
                     with c_sel.container(key="bed_box"):
-                        st.selectbox("床位", UNITS[unit], key="bed_sel", format_func=bed_label,
+                        st.selectbox("床位", beds, key="bed_sel", format_func=bed_label,
                                      on_change=cb_select_bed, label_visibility="collapsed")
                     can_save = True
                 else:
@@ -1271,6 +1471,8 @@ def render_account_header(title_html: str):
                     if unit:
                         st.caption(f"單位帳號:**{unit}**")
                         st.caption(f"儲存位置:{storage_name()}")
+                        if st.button("🛏️ 新增 / 管理床位", use_container_width=True):
+                            dialog_to_open = "beds"
                         if st.button(f"🗑️ 清空 {ss.bed_sel} 資料", use_container_width=True):
                             dialog_to_open = "clear"
                     else:
@@ -1296,6 +1498,9 @@ def open_account_dialog(which, patients: dict, pid, payload) -> None:
         target, label = ("unit", unit, bed), f"{unit} · {bed}"
         if which == "clear":
             clear_bed_dialog(unit, bed)
+            return
+        if which == "beds":
+            beds_dialog(unit)
             return
     elif pid:
         target, label = ("acct", pid), patients[pid]
@@ -1365,7 +1570,7 @@ def main():
     if unit:
         with tab_beds[0]:
             rows = []
-            for b_ in UNITS[unit]:
+            for b_ in all_beds(unit):
                 if b_ in latest:
                     t, d = latest[b_]
                     sm = d.get("summary", {})
