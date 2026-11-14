@@ -622,6 +622,14 @@ MIN_LEN = 4  # 帳號、密碼最少字數
 PBKDF2_ROUNDS = 200_000
 
 
+HISTORY_UNITS_NOTE = (
+    "**單位**:BW g ｜ Feeding 每餐 mL、q 小時 ｜ PN Glucose % / AA % ｜ "
+    "IVF 速率 mL/hr ｜ TF mL/kg/day ｜ Cal kcal/kg/day (吃 + 打) ｜ SIR mg/kg/min ｜ "
+    "AA PN 胺基酸 g/kg/day (占 TC %) ｜ Fat IF 20% 脂肪 g/kg/day (占 TC %)  \n"
+    "TC (總熱量) 只計 PN + IVF + Fat,不含奶水。"
+)
+
+
 def _history_cols(d: dict) -> dict:
     """歷史紀錄的資料欄 (順序: Feeding、PN、IVF、TF、Cal、SIR、AA、Fat)。
     數值取自已存的「今日結果」字串,舊紀錄也能顯示:
@@ -1302,12 +1310,7 @@ def history_dialog(target: tuple, label: str) -> None:
             for c, name in zip(cells[2:], cols):
                 c.markdown(_cell(r[name]), unsafe_allow_html=True)
 
-    st.caption(
-        "**單位**:BW g ｜ Feeding 每餐 mL、q 小時 ｜ PN Glucose % / AA % ｜ "
-        "IVF 速率 mL/hr ｜ TF mL/kg/day ｜ Cal kcal/kg/day (吃 + 打) ｜ SIR mg/kg/min ｜ "
-        "AA PN 胺基酸 g/kg/day (占 TC %) ｜ Fat IF 20% 脂肪 g/kg/day (占 TC %)  \n"
-        "TC (總熱量) 只計 PN + IVF + Fat,不含奶水。"
-    )
+    st.caption(HISTORY_UNITS_NOTE)
 
     rid = ss.get("confirm_del_record")
     ids = [r["_id"] for r in rows]
@@ -1571,16 +1574,18 @@ def main():
         with tab_beds[0]:
             rows = []
             for b_ in all_beds(unit):
+                row = {"床位": b_, "上次儲存": "—", "備註": "", "BW (g)": ""}
                 if b_ in latest:
                     t, d = latest[b_]
-                    sm = d.get("summary", {})
-                    rows.append({"床位": b_, "上次儲存": t, "BW (g)": d.get("bw_g"),
-                                 "備註": d.get("bed", ""), **sm})
-                else:
-                    rows.append({"床位": b_, "上次儲存": "—"})
+                    row.update({"上次儲存": t, "備註": d.get("note") or d.get("bed") or "",
+                                "BW (g)": fmt(d.get("bw_g", 0)), **_history_cols(d)})
+                rows.append(row)
+            # 欄位順序與歷史紀錄相同
+            cols = ["床位", "上次儲存", "備註", "BW (g)"] + list(_history_cols({}))
             st.caption(f"{unit} 各床最近一次紀錄 (於上方選擇床位即可載入)")
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                         height=min(40 + 35 * len(rows), 950))
+            st.dataframe(pd.DataFrame(rows, columns=cols).fillna(""), hide_index=True,
+                         use_container_width=True, height=min(40 + 35 * len(rows), 950))
+            st.caption(HISTORY_UNITS_NOTE)
 
     with tab_main:
         top = st.container()
