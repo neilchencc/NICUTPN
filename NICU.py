@@ -652,7 +652,7 @@ PBKDF2_ROUNDS = 200_000
 
 
 HISTORY_UNITS_NOTE = (
-    "**單位**:BW g ｜ Feeding 每餐 mL、q 小時 ｜ PN Glucose % / AA % ｜ "
+    "**單位**:BW g ｜ Feeding 每餐 mL、q 小時 ｜ PN Glucose % / AA % 速率 mL/hr ｜ "
     "IVF 速率 mL/hr ｜ TF mL/kg/day ｜ Cal kcal/kg/day (吃 + 打) ｜ SIR mg/kg/min ｜ "
     "AA PN 胺基酸 g/kg/day (占 TC %) ｜ Fat IF 20% 脂肪 g/kg/day (占 TC %)  \n"
     "TC (總熱量) 只計 PN + IVF + Fat,不含奶水。"
@@ -685,7 +685,8 @@ def _history_cols(d: dict) -> dict:
     fat_pct = num_at(sm.get("Fat"), r"/([^/()]+)\)\s*$")        # Fat 占 TC %
     return {
         "Feeding": sm.get("Feeding", "—"),
-        "PN": f"{fmt(d.get('pn_glu', 0))}% / {fmt(d.get('pn_aa', 0))}%" if has_pn else "—",
+        "PN": (f"{fmt(d.get('pn_glu', 0))}% / {fmt(d.get('pn_aa', 0))}% "
+               f"{fmt(d.get('pn_rate', 0))}") if has_pn else "—",
         "IVF": sm.get("IVF", "—"),
         "TF": sm.get("TF", "—"),
         "Cal": sm.get("Cal", "—"),
