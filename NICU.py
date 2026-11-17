@@ -13,13 +13,22 @@ NICU 營養計算器 (Streamlit)
   在標題列「登入 / 註冊」登入後,可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
   各單位可新增自訂床位 (只有自訂床位可刪除,刪除時連同紀錄);
   自訂床位存在 SQLite 的 custom_beds 表,或 Google Sheets 的 beds 工作表。
-  儲存位置: secrets 有 [gcp_service_account] 與 [gsheet] 時存到 Google Sheets
-  (需 pip install gspread),否則存本機 SQLite (nicu_records.db,環境變數 NICU_DB 可改路徑)。
   密碼可在 .streamlit/secrets.toml 以 [passwords] PICU = "..." 覆寫。
 個人帳號 (移植自 TPN 計算器;與單位帳號共用同一個登入對話框):
   - 標題旁的按鈕: 登入 / 註冊 (帳號、密碼皆需 4 個字以上,密碼以 PBKDF2 雜湊儲存)
   - 登入後可選擇病患、儲存、看歷史紀錄 (載入 / 刪除)、新增 / 管理 / 刪除病患
-  - 資料存在 SQLite nicu_accounts.db (環境變數 NICU_ACCT_DB_DIR 可指定資料夾)
+儲存位置 (單位帳號與個人帳號都一樣):
+  - secrets 有 Google 試算表設定時,全部存到 Google Sheets (需 pip install gspread):
+        [gsheets]
+        spreadsheet = "試算表網址或 ID"
+        gcp_json = '''
+        { ...整個服務帳號金鑰 .json 檔的內容原樣貼上... }
+        '''
+    (舊寫法 [gsheet] url / key + [gcp_service_account] 也可以)
+    工作表: records、beds (單位帳號);acct_users、acct_patients、acct_records (個人帳號)
+    ※ 請用一份「NICU 專用」的試算表,不要和 TPN 計算器共用 (兩者都有 records 工作表)
+  - 沒有設定時存本機 SQLite: 單位帳號 nicu_records.db (環境變數 NICU_DB 可改路徑)、
+    個人帳號 nicu_accounts.db (環境變數 NICU_ACCT_DB_DIR 可指定資料夾)
   - 需要 Streamlit >= 1.40 (st.dialog、具 key 的 container)
 執行: streamlit run streamlit_app.py
 """
@@ -153,8 +162,11 @@ GSHEET_CACHE_TTL = 30  # 秒;避免每次畫面更新都讀 Google Sheets (API �
 
 
 def use_gsheets() -> bool:
+    """secrets 有 Google 試算表設定就用 Google Sheets。支援兩種寫法:
+    [gsheets] spreadsheet + gcp_json (同 TPN 計算器),或舊的 [gsheet] url/key + [gcp_service_account]。"""
     try:
-        return "gcp_service_account" in st.secrets and "gsheet" in st.secrets
+        return "gsheets" in st.secrets or (
+            "gcp_service_account" in st.secrets and "gsheet" in st.secrets)
     except Exception:
         return False
 
@@ -164,11 +176,30 @@ def storage_name() -> str:
 
 
 @st.cache_resource(show_spinner=False)
+def _gs_book():
+    """連線到 Google 試算表 (整個 app 共用一個連線)。"""
+    import gspread  # 只有使用 Google Sheets 時才需要安裝
+    try:
+        if "gsheets" in st.secrets:
+            cfg = st.secrets["gsheets"]
+            ref = str(cfg["spreadsheet"]).strip()
+            creds = (json.loads(cfg["gcp_json"]) if "gcp_json" in cfg
+                     else dict(st.secrets["gcp_service_account"]))
+        else:
+            cfg = st.secrets["gsheet"]
+            ref = str(cfg["url"] if "url" in cfg else cfg["key"]).strip()
+            creds = dict(st.secrets["gcp_service_account"])
+    except Exception as e:
+        raise RuntimeError("Google 試算表的 secrets 設定不完整或格式錯誤 "
+                           f"({type(e).__name__}:{e})") from e
+    gc = gspread.service_account_from_dict(creds)
+    return gc.open_by_url(ref) if ref.startswith("http") else gc.open_by_key(ref)
+
+
+@st.cache_resource(show_spinner=False)
 def _gsheet_ws():
     import gspread  # 只有使用 Google Sheets 時才需要安裝
-    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    cfg = st.secrets["gsheet"]
-    sh = gc.open_by_url(cfg["url"]) if "url" in cfg else gc.open_by_key(cfg["key"])
+    sh = _gs_book()
     try:
         ws = sh.worksheet(GSHEET_TAB)
     except gspread.exceptions.WorksheetNotFound:
@@ -268,9 +299,7 @@ BED_MAX_LEN = 20
 @st.cache_resource(show_spinner=False)
 def _gsheet_beds_ws():
     import gspread
-    gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    cfg = st.secrets["gsheet"]
-    sh = gc.open_by_url(cfg["url"]) if "url" in cfg else gc.open_by_key(cfg["key"])
+    sh = _gs_book()
     try:
         ws = sh.worksheet(GSHEET_BEDS_TAB)
     except gspread.exceptions.WorksheetNotFound:
@@ -689,18 +718,27 @@ def _pick_acct_db_path() -> Path:
     raise RuntimeError("找不到可寫入的位置來存放帳號資料庫")
 
 
-ACCT_DB_PATH = _pick_acct_db_path()
+@functools.lru_cache(maxsize=1)
+def acct_db_path() -> Path:
+    """只有使用 SQLite 時才需要決定資料庫位置。"""
+    path = _pick_acct_db_path()
+    acct_init_db(path)
+    return path
+
+
+def acct_storage_name() -> str:
+    return "Google Sheets" if use_gsheets() else str(acct_db_path())
 
 
 def _acct_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(ACCT_DB_PATH)
+    conn = sqlite3.connect(acct_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def acct_init_db() -> None:
-    with closing(_acct_db()) as c, c:
+def acct_init_db(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as c, c:
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -728,6 +766,86 @@ def acct_init_db() -> None:
         )
 
 
+# --- 個人帳號的 Google Sheets 儲存 ---
+# 每個表是一個工作表,第 1 列為欄名;寫入一律用 RAW (文字不會被當成公式或數字)。
+ACCT_TABLES = {
+    "acct_users": ["id", "username", "pw_hash", "salt", "created_at"],
+    "acct_patients": ["id", "user_id", "name", "created_at"],
+    "acct_records": ["id", "patient_id", "created_at", "note", "data"],
+}
+
+
+@st.cache_resource(show_spinner=False)
+def _acct_sheets() -> dict:
+    """確認個人帳號的工作表存在 (不存在就建立),回傳 {表名: worksheet}。"""
+    import gspread
+    book = _gs_book()
+    wss = {}
+    for name, cols in ACCT_TABLES.items():
+        try:
+            ws = book.worksheet(name)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = book.add_worksheet(title=name, rows=1000, cols=len(cols))
+        if ws.row_values(1) != cols:
+            ws.update(range_name="A1", values=[cols], value_input_option="RAW")
+        wss[name] = ws
+    return wss
+
+
+def _acct_rows(name: str, values: list) -> list:
+    cols = ACCT_TABLES[name]
+    out = []
+    for row in values[1:]:
+        if any(row):
+            row = list(row) + [""] * (len(cols) - len(row))
+            out.append(dict(zip(cols, row)))
+    return out
+
+
+def _acct_read_fresh(name: str) -> list:
+    """直接讀取 (不經暫存),回傳 [{欄名: 值(字串)}, ...],依寫入順序。"""
+    return _acct_rows(name, _acct_sheets()[name].get_all_values())
+
+
+@st.cache_data(ttl=GSHEET_CACHE_TTL, show_spinner=False)
+def _acct_read(name: str) -> list:
+    """讀取並暫存;本程式寫入後會立即清除暫存。"""
+    return _acct_read_fresh(name)
+
+
+def _acct_insert(name: str, row: dict) -> None:
+    _acct_sheets()[name].append_row(
+        [str(row.get(c, "")) for c in ACCT_TABLES[name]], value_input_option="RAW",
+        insert_data_option="INSERT_ROWS", table_range="A1")
+    _acct_read.clear()
+
+
+def _acct_delete_where(name: str, pred) -> int:
+    """刪除符合條件的所有列 (一次 API 呼叫),回傳刪除筆數。"""
+    ws = _acct_sheets()[name]
+    cols = ACCT_TABLES[name]
+    row_nums = []
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        row = list(row) + [""] * (len(cols) - len(row))
+        if any(row) and pred(dict(zip(cols, row))):
+            row_nums.append(i)
+    if row_nums:  # 由下往上刪,前面的列號才不會位移
+        ws.spreadsheet.batch_update({"requests": [
+            {"deleteDimension": {"range": {"sheetId": ws.id, "dimension": "ROWS",
+                                           "startIndex": r - 1, "endIndex": r}}}
+            for r in sorted(row_nums, reverse=True)]})
+    _acct_read.clear()
+    return len(row_nums)
+
+
+def _acct_new_id(prefix: str) -> str:
+    return f"{prefix}{secrets.token_hex(6)}"  # 英文字母開頭,避免被當成數字
+
+
+def _acct_owned(user_id) -> set:
+    return {p["id"] for p in _acct_read("acct_patients") if p["user_id"] == user_id}
+
+
 def _now_str() -> str:
     return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -745,6 +863,15 @@ def acct_create_user(username: str, password: str):
     if len(password) < MIN_LEN:
         return None, f"密碼至少需要 {MIN_LEN} 個字"
     salt = secrets.token_hex(16)
+    if use_gsheets():
+        if any(u["username"].lower() == username.lower()
+               for u in _acct_read_fresh("acct_users")):
+            return None, "此帳號已被使用"
+        uid = _acct_new_id("u")
+        _acct_insert("acct_users", {"id": uid, "username": username,
+                                    "pw_hash": _hash_pw(password, salt), "salt": salt,
+                                    "created_at": _now_str()})
+        return uid, None
     try:
         with closing(_acct_db()) as c, c:
             cur = c.execute(
@@ -757,14 +884,26 @@ def acct_create_user(username: str, password: str):
 
 
 def acct_verify_user(username: str, password: str):
-    with closing(_acct_db()) as c:
-        row = c.execute("SELECT * FROM users WHERE username = ?", (username.strip(),)).fetchone()
+    if use_gsheets():
+        name = username.strip().lower()
+        row = next((u for u in _acct_read("acct_users") if u["username"].lower() == name),
+                   None)
+    else:
+        with closing(_acct_db()) as c:
+            row = c.execute("SELECT * FROM users WHERE username = ?",
+                            (username.strip(),)).fetchone()
     if row and hmac.compare_digest(row["pw_hash"], _hash_pw(password, row["salt"])):
         return {"id": row["id"], "username": row["username"]}
     return None
 
 
-def acct_list_patients(user_id: int) -> list:
+def acct_list_patients(user_id) -> list:
+    if use_gsheets():
+        counts = {}
+        for r in _acct_read("acct_records"):
+            counts[r["patient_id"]] = counts.get(r["patient_id"], 0) + 1
+        return [{"id": p["id"], "name": p["name"], "n": counts.get(p["id"], 0)}
+                for p in _acct_read("acct_patients") if p["user_id"] == user_id]
     with closing(_acct_db()) as c:
         return c.execute(
             """SELECT p.id, p.name, COUNT(r.id) AS n FROM patients p
@@ -774,7 +913,15 @@ def acct_list_patients(user_id: int) -> list:
         ).fetchall()
 
 
-def acct_create_patient(user_id: int, name: str):
+def acct_create_patient(user_id, name: str):
+    if use_gsheets():
+        if any(p["user_id"] == user_id and p["name"] == name
+               for p in _acct_read_fresh("acct_patients")):
+            return None, f"已經有名為「{name}」的病患"
+        pid = _acct_new_id("p")
+        _acct_insert("acct_patients", {"id": pid, "user_id": user_id, "name": name,
+                                       "created_at": _now_str()})
+        return pid, None
     try:
         with closing(_acct_db()) as c, c:
             cur = c.execute("INSERT INTO patients (user_id, name, created_at) VALUES (?, ?, ?)",
@@ -784,12 +931,26 @@ def acct_create_patient(user_id: int, name: str):
         return None, f"已經有名為「{name}」的病患"
 
 
-def acct_delete_patient(user_id: int, patient_id: int) -> None:
+def acct_delete_patient(user_id, patient_id) -> None:
+    if use_gsheets():
+        if patient_id not in _acct_owned(user_id):
+            return
+        _acct_delete_where("acct_records", lambda r: r["patient_id"] == patient_id)
+        _acct_delete_where("acct_patients",
+                           lambda p: p["id"] == patient_id and p["user_id"] == user_id)
+        return
     with closing(_acct_db()) as c, c:  # 紀錄透過 ON DELETE CASCADE 一併刪除
         c.execute("DELETE FROM patients WHERE id = ? AND user_id = ?", (patient_id, user_id))
 
 
-def acct_add_record(user_id: int, patient_id: int, note: str, data: dict) -> bool:
+def acct_add_record(user_id, patient_id, note: str, data: dict) -> bool:
+    if use_gsheets():
+        if patient_id not in _acct_owned(user_id):
+            return False
+        _acct_insert("acct_records", {"id": _acct_new_id("r"), "patient_id": patient_id,
+                                      "created_at": _now_str(), "note": note,
+                                      "data": json.dumps(data, ensure_ascii=False)})
+        return True
     with closing(_acct_db()) as c, c:
         owner = c.execute("SELECT 1 FROM patients WHERE id = ? AND user_id = ?",
                           (patient_id, user_id)).fetchone()
@@ -800,7 +961,14 @@ def acct_add_record(user_id: int, patient_id: int, note: str, data: dict) -> boo
         return True
 
 
-def acct_list_records(user_id: int, patient_id: int) -> list:
+def acct_list_records(user_id, patient_id) -> list:
+    if use_gsheets():
+        if patient_id not in _acct_owned(user_id):
+            return []
+        rows = [r for r in _acct_read("acct_records") if r["patient_id"] == patient_id]
+        # 由新到舊;同時間者後寫入的排前面
+        return [r for _, r in sorted(enumerate(rows), key=lambda t: (t[1]["created_at"], t[0]),
+                                     reverse=True)]
     with closing(_acct_db()) as c:
         return c.execute(
             """SELECT r.id, r.created_at, r.note, r.data FROM records r
@@ -811,17 +979,18 @@ def acct_list_records(user_id: int, patient_id: int) -> list:
         ).fetchall()
 
 
-def acct_delete_record(user_id: int, record_id: int) -> None:
+def acct_delete_record(user_id, record_id) -> None:
+    if use_gsheets():
+        owned = _acct_owned(user_id)
+        _acct_delete_where("acct_records",
+                           lambda r: r["id"] == record_id and r["patient_id"] in owned)
+        return
     with closing(_acct_db()) as c, c:
         c.execute(
             """DELETE FROM records WHERE id = ? AND patient_id IN
                (SELECT id FROM patients WHERE user_id = ?)""",
             (record_id, user_id),
         )
-
-
-acct_init_db()
-
 
 # --- 狀態輔助 ---
 def acct_flash(kind: str, msg: str, seconds: float = 0) -> None:
@@ -854,6 +1023,13 @@ def rerun_if_requested() -> None:
         st.rerun()
 
 
+def _safe_storage_label() -> str:
+    try:
+        return storage_name() if ss.get("unit") else acct_storage_name()
+    except Exception:
+        return storage_name()
+
+
 def db_safe(func):
     """資料庫出錯時不讓整個 app 當掉,改把錯誤訊息顯示在畫面上。"""
     @functools.wraps(func)
@@ -862,7 +1038,9 @@ def db_safe(func):
             return func(*args, **kwargs)
         except Exception as e:  # SQLite / Google Sheets 等錯誤
             ss._acct_db_err = (f"資料存取錯誤 ({type(e).__name__}):{e}\n\n"
-                               f"儲存位置:{storage_name() if ss.get('unit') else ACCT_DB_PATH}")
+                               f"儲存位置:{_safe_storage_label()}"
+                               + ("\n\nGoogle Sheets:請確認試算表已「共用」給服務帳號 (編輯者)"
+                                  if use_gsheets() else ""))
     return wrapper
 
 
@@ -1410,14 +1588,22 @@ def render_account_header(title_html: str):
     unit = ss.get("unit")
     user = ss.get("user")
     latest = {}
+    patients = {}
+    load_err = None
     if unit:
-        latest = latest_by_bed(unit)
-        beds = all_beds(unit)  # 預設床位 + 自訂床位
+        beds = UNITS[unit]
+        try:
+            latest = latest_by_bed(unit)
+            beds = all_beds(unit)  # 預設床位 + 自訂床位
+        except Exception as e:  # 試算表暫時連不上: 先顯示預設床位
+            load_err = e
         if ss.get("bed_sel") not in beds:
             ss.bed_sel = UNITS[unit][0]
-    patients = {}
     if user:
-        patients = {p["id"]: p["name"] for p in acct_list_patients(user["id"])}
+        try:
+            patients = {p["id"]: p["name"] for p in acct_list_patients(user["id"])}
+        except Exception as e:
+            load_err = e
         if ss.get("patient_id") not in patients:
             if patients:
                 ss.patient_id = next(iter(patients))
@@ -1484,6 +1670,9 @@ def render_account_header(title_html: str):
                             dialog_to_open = "patients"
                     st.button("🚪 登出", on_click=cb_logout, use_container_width=True)
     show_db_error()
+    if load_err is not None:
+        st.error(f"讀取紀錄失敗 ({type(load_err).__name__}):{load_err}\n\n"
+                 f"儲存位置:{_safe_storage_label()}")
     return dialog_to_open, patients, pid, latest
 
 
