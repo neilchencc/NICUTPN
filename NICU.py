@@ -1754,10 +1754,14 @@ def main():
 
     # --- 病人資料 ---
     sb.header("病人資料")
-    sb.text_input("備註 (請勿輸入姓名 / 病歷號)", key="bed")
+    # 目前選定的床位 (個人帳號為病患),只顯示、不可修改
+    if unit:
+        sb.text_input("床位", value=f"{unit} · {ss.get('bed_sel', '')}", disabled=True)
+    elif acct_pid:
+        sb.text_input("病患", value=acct_patients.get(acct_pid, ""), disabled=True)
     num(sb, "體重 BW (g)", "bw_g", step=10.0, min_value=300.0, max_value=8000.0)
     num(sb, "餵食間隔 q (h)", "q_h", step=1.0, min_value=1.0, max_value=24.0)
-    sb.caption("IV / PN 速率單位為 mL/hr (微滴 gtt/min = mL/hr)")
+    sb.text_input("備註", key="bed")
 
     tab_names = ["營養計算", "RI 計算", "參考表"] + (["床位總覽"] if unit else [])
     tab_main, tab_ri, tab_ref, *tab_beds = st.tabs(tab_names)
