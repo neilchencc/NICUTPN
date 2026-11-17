@@ -9,7 +9,8 @@ NICU 營養計算器 (Streamlit)
   - PN 滲透壓 = Glu% x 50 + AA% x 100 + Na x 2 + K x 2
   - 電解質、Ca/P、Fe、Zn 與奶水成分 (每公升) / 母乳添加劑 (每 100 mL) 小計
 另含「RI 計算」與參考表 (IVF、本院 PN 套餐、奶水成分)。
-登入 (選用): 帳號 PICU (床位 PI-01~PI-25) / NBC (床位 NBC-01~NBC-27),
+登入 (選用): 帳號 PICU (床位 PI-01~PI-26) / NBC (床位 NBC-01~NBC-27),
+  兩單位皆無 04、13、14、24 床;
   在標題列「登入 / 註冊」登入後,可點選床位、自動讀取該床最近一次紀錄、儲存與查看歷次紀錄。
   各單位可新增自訂床位 (只有自訂床位可刪除,刪除時連同紀錄);
   自訂床位存在 SQLite 的 custom_beds 表,或 Google Sheets 的 beds 工作表。
@@ -135,9 +136,10 @@ FORTIFIER_TABLE = {
 # 登入與床位紀錄
 # ----------------------------------------------------------------------
 TW_TZ = timezone(timedelta(hours=8))
+SKIP_BED_NUMS = {4, 13, 14, 24}  # 不使用的床號
 UNITS = {
-    "PICU": [f"PI-{i:02d}" for i in range(1, 26)],
-    "NBC": [f"NBC-{i:02d}" for i in range(1, 28)],
+    "PICU": [f"PI-{i:02d}" for i in range(1, 27) if i not in SKIP_BED_NUMS],
+    "NBC": [f"NBC-{i:02d}" for i in range(1, 28) if i not in SKIP_BED_NUMS],
 }
 DEFAULT_PASSWORD = "hmmch"
 DB_PATH = Path(os.environ.get("NICU_DB", Path(__file__).parent / "nicu_records.db"))
